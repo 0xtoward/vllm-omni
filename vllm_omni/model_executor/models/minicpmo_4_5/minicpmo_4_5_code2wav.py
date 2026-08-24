@@ -26,6 +26,7 @@ from .batched_token2wav import (
     BatchedToken2WavState,
     state_shape_signature,
 )
+from .runtime_prompt_manifest import RuntimePromptManifest
 
 logger = init_logger(__name__)
 
@@ -135,6 +136,22 @@ class MiniCPMO45Code2Wav(nn.Module):
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        manifest_mode = str(extra.get("code2wav_npu_graph_prompt_manifest_mode", "off")).strip().lower()
+        self._runtime_prompt_manifest: RuntimePromptManifest | None = None
+        if manifest_mode != "off":
+            graph_mode = str(extra.get("code2wav_npu_graph_mode", "off")).lower()
+            if manifest_mode == "producer" and graph_mode != "off":
+                raise ValueError("runtime prompt producer must run with code2wav graph mode=off")
+            manifest_raw = str(extra.get("code2wav_npu_graph_prompt_manifest", "")).strip()
+            if not manifest_raw or not Path(manifest_raw).is_absolute():
+                raise ValueError("runtime prompt manifest path must be absolute")
+            source_raw = str(extra.get("code2wav_npu_graph_prompt_source_manifest", "")).strip()
+            self._runtime_prompt_manifest = RuntimePromptManifest(
+                mode=manifest_mode,
+                manifest_path=Path(manifest_raw),
+                source_manifest_path=Path(source_raw) if source_raw else None,
+                manifest_sha256=str(extra.get("code2wav_npu_graph_prompt_manifest_sha256", "")),
+            )
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -233,6 +250,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 os.replace(temporary_path, prompt_path)
             finally:
                 temporary_path.unlink(missing_ok=True)
+        if self._runtime_prompt_manifest is not None:
+            self._runtime_prompt_manifest.observe_materialized(
+                cache_key=cache_key,
+                waveform=waveform,
+                sample_rate=sample_rate_hz,
+                canonical_wav=prompt_path,
+            )
         return cache_key, entry
 
     def _resolve_prompt(
@@ -249,6 +273,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 ref_audio,
                 meta.get("ref_audio_sr"),
             )
+            if self._runtime_prompt_manifest is not None:
+                self._runtime_prompt_manifest.bind_request(state_id, cache_key)
             return entry.cache_id, entry.path, cache_key
 
         if previous is not None:
@@ -259,11 +285,16 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is not None:
             return entry.cache_id, entry.path, cache_key
 
-        return (
-            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
-            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
-            None,
-        )
+        prompt_cache_id = str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id))
+        prompt_wav = str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav))
+        if self._runtime_prompt_manifest is not None:
+            # Seed-TTS file-reference serving reaches Token2Wav through this
+            # path, not ``codes.ref``.  Bind the request to the exact WAV that
+            # the backend will consume so feature observation can seal/verify
+            # the same prompt rather than an unused materialization branch.
+            manifest_key = self._runtime_prompt_manifest.observe_prompt_wav(Path(prompt_wav))
+            self._runtime_prompt_manifest.bind_request(state_id, manifest_key)
+        return prompt_cache_id, prompt_wav, None
 
     def _release_request_prompt(self, state_id: str) -> None:
         cache_key = self._request_prompt_keys.pop(state_id, None)
@@ -612,6 +643,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
+                if self._runtime_prompt_manifest is not None:
+                    for item in bucket:
+                        self._runtime_prompt_manifest.observe_features(
+                            item.state_id,
+                            features,
+                        )
                 states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
@@ -645,6 +682,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
+                if self._runtime_prompt_manifest is not None:
+                    for item in bucket:
+                        self._runtime_prompt_manifest.observe_features(
+                            item.state_id,
+                            features,
+                        )
                 if bucket[0].previous is None:
                     states = self.backend.setup_batch(features, batch_size)
                 else:
@@ -742,6 +785,8 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         from vllm_omni.platforms import current_omni_platform
 
+        graph_bootstrap = None
+
         if current_omni_platform.is_npu():
             # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
             # so use the in-tree NPU-aware adapter instead. It delegates to
@@ -750,6 +795,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
                 MiniCPMO45Token2wav as Token2wav,
             )
+            from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav_graph import (
+                Stage2EstimatorGraphBootstrap,
+            )
+
+            graph_bootstrap = Stage2EstimatorGraphBootstrap.from_model(self)
+            graph_bootstrap.prepare_runtime_before_token2wav_load()
         else:
             from stepaudio2.token2wav import Token2wav
 
@@ -776,3 +827,5 @@ class MiniCPMO45Code2Wav(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
+        if graph_bootstrap is not None:
+            graph_bootstrap.install_instance_hooks_and_warm(self.backend)

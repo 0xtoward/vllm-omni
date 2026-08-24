@@ -18,7 +18,7 @@ This module:
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -107,17 +107,32 @@ def _patched_attention_forward_chunk(
 
 
 @contextmanager
-def npu_math_sdpa_context() -> Iterator[None]:
-    """Force SDPA MATH backend so Ascend does not call fused FA."""
+def npu_math_sdpa_context(*, require_available: bool = False) -> Iterator[None]:
+    """Force SDPA MATH backend so Ascend does not call fused FA.
+
+    Import/setup failures may fall back only for legacy callers.  Exceptions
+    raised by the model body after ``yield`` are never caught here.
+    """
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
-
-        with sdpa_kernel(SDPBackend.MATH):
-            yield
-    except Exception:
-        # Older torch / missing backend enum — just run as-is.
+    except (ImportError, AttributeError) as exc:
+        if require_available:
+            raise RuntimeError("MATH SDPA backend is unavailable") from exc
         with nullcontext():
             yield
+        return
+    stack = ExitStack()
+    try:
+        stack.enter_context(sdpa_kernel(SDPBackend.MATH))
+    except Exception as exc:
+        stack.close()
+        if require_available:
+            raise RuntimeError("MATH SDPA backend cannot be selected") from exc
+        with nullcontext():
+            yield
+        return
+    with stack:
+        yield
 
 
 def _disable_upsample_encoder_compile() -> None:

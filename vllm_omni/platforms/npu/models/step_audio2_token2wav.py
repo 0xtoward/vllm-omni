@@ -113,20 +113,33 @@ def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
 
 
 @contextmanager
-def npu_token2wav_sdpa_context() -> Iterator[None]:
-    """Expand CosyVoice masks + force MATH SDPA to avoid FA 161001."""
+def npu_token2wav_sdpa_context(*, require_math: bool = False) -> Iterator[None]:
+    """Expand CosyVoice masks + force MATH SDPA to avoid FA 161001.
+
+    Only dependency/setup failures may use the legacy no-op fallback.  A model
+    exception raised after ``yield`` must propagate unchanged.
+    """
     try:
         from vllm_omni.platforms.npu.models.cosyvoice2_dit_attn import (
             apply_cosyvoice2_dit_attn_npu_patch,
             npu_math_sdpa_context,
         )
-
-        apply_cosyvoice2_dit_attn_npu_patch()
-        with npu_math_sdpa_context():
-            yield
-    except Exception:
+    except ImportError as exc:
+        if require_math:
+            raise RuntimeError("CosyVoice2 NPU SDPA patch is unavailable") from exc
         with nullcontext():
             yield
+        return
+    try:
+        apply_cosyvoice2_dit_attn_npu_patch()
+    except Exception as exc:
+        if require_math:
+            raise RuntimeError("CosyVoice2 NPU SDPA patch setup failed") from exc
+        with nullcontext():
+            yield
+        return
+    with npu_math_sdpa_context(require_available=require_math):
+        yield
 
 
 def _patched_ensure_models_loaded(self) -> None:
