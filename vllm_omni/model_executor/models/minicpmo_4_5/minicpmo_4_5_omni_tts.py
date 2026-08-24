@@ -11,6 +11,7 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -23,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
@@ -71,14 +73,29 @@ def _apply_repetition_penalty(
     *,
     penalty: float,
     window_size: int,
+    inplace: bool = False,
+    penalty_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Match MiniCPMTTS' frequency-aware repetition penalty."""
+    """Match MiniCPMTTS' frequency-aware repetition penalty.
+
+    Only ids in the short history window can be changed. Counting the window
+    directly avoids the full-vocabulary AI-CPU bincount and full-vocabulary
+    scale passes on every decode step.
+    """
     if penalty == 1.0 or history.numel() == 0:
         return logits
     recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
-    return torch.where(logits < 0, logits * alpha, logits / alpha)
+    counts = (recent.unsqueeze(1) == recent.unsqueeze(0)).sum(dim=1).to(dtype=logits.dtype)
+    penalty_base = (
+        penalty_tensor
+        if penalty_tensor is not None
+        else torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype)
+    )
+    alpha = torch.pow(penalty_base, counts)
+    scored = logits if inplace else logits.clone()
+    selected = scored[..., recent]
+    scored[..., recent] = torch.where(selected < 0, selected * alpha, selected / alpha)
+    return scored
 
 
 def _apply_top_k_top_p(
@@ -87,9 +104,10 @@ def _apply_top_k_top_p(
     top_k: int | None,
     top_p: float | None,
     min_tokens_to_keep: int = 3,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """Apply the same candidate floors as the upstream Transformers warpers."""
-    filtered = logits.clone()
+    filtered = logits if inplace else logits.clone()
     vocab_size = filtered.shape[-1]
     # MiniCPM-o's gen_logits() appends TopPLogitsWarper before
     # TopKLogitsWarper. The order is observable for fixed-seed sampling.
@@ -120,6 +138,29 @@ class _MiniCPMTTSProjector(nn.Module):
         return self.linear2(self.relu(self.linear1(hidden_states)))
 
 
+class _CodecSamplerCapturedGraph:
+    def __init__(
+        self,
+        graph: Any,
+        pool: object,
+        static_inputs: tuple[torch.Tensor, ...],
+        output: torch.Tensor,
+    ):
+        self.graph = graph
+        self.pool = pool
+        self.static_inputs = static_inputs
+        self.output = output
+
+    def replay(self, inputs: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        for static, current in zip(self.static_inputs, inputs, strict=True):
+            static.copy_(current)
+        self.graph.replay()
+        # Multinomial consumes this persistent output immediately on the same
+        # stream. The following replay is enqueued after that consume, so a
+        # per-token clone/copy is unnecessary.
+        return self.output
+
+
 class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """Runner-owned MiniCPM-o 4.5 Talker that emits codec tokens only."""
 
@@ -133,9 +174,41 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.config = config
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
+        self._continue_stop_row: torch.Tensor | None = None
+        self._finished_stop_row: torch.Tensor | None = None
+        self._fallback_stop_sampler = Sampler()
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
+        npu_default = "1" if current_omni_platform.is_npu() else "0"
+        self._codec_sampler_graph_enabled = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_SAMPLER_NPUGRAPH", npu_default
+        ).lower() in ("1", "true", "yes", "on")
+        self._codec_sampler_graphs: dict[tuple[Any, ...], _CodecSamplerCapturedGraph] = {}
+        self._codec_sampler_graph_replayed_keys: set[tuple[Any, ...]] = set()
+        self._codec_sampler_penalty_tensor: torch.Tensor | None = None
+        self._codec_sampler_graph_failed = False
+        self._codec_sampler_graph_hits = 0
+        self._codec_sampler_graph_captures = 0
+        if self._codec_sampler_graph_enabled:
+            logger.info("MINICPMO45_CODEC_SAMPLER_NPUGRAPH event=enabled")
+        raw_sparse_chunk = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES",
+            "0",
+        )
+        try:
+            self._sparse_chunk_frames = max(0, int(raw_sparse_chunk))
+        except ValueError:
+            raise ValueError(
+                "VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES must be an integer"
+            ) from None
+        self._sparse_emit_total = 0
+        self._sparse_suppressed_total = 0
+        if self._sparse_chunk_frames:
+            logger.info(
+                "MINICPMO45_SPARSE_CHUNK event=enabled frames=%d",
+                self._sparse_chunk_frames,
+            )
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is None and getattr(config, "model_type", None) == "minicpmtts":
@@ -370,6 +443,158 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _codec_sampler_probabilities(
+        self,
+        hidden_state: torch.Tensor,
+        history: torch.Tensor,
+        *,
+        allow_eos: bool,
+    ) -> torch.Tensor:
+        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
+        logits = _apply_repetition_penalty(
+            logits,
+            history,
+            penalty=self._codec_repetition_penalty,
+            window_size=_REPETITION_WINDOW,
+            inplace=True,
+            penalty_tensor=self._codec_sampler_penalty_tensor,
+        )
+        if not allow_eos:
+            logits[..., self._num_audio_tokens - 1] = float("-inf")
+        logits = _apply_top_k_top_p(
+            logits,
+            top_k=self._codec_top_k,
+            top_p=self._codec_top_p,
+            min_tokens_to_keep=3,
+            inplace=True,
+        )
+        return torch.softmax(logits, dim=-1)
+
+    def _capture_codec_sampler_graph(
+        self,
+        inputs: tuple[torch.Tensor, torch.Tensor],
+        *,
+        allow_eos: bool,
+    ) -> _CodecSamplerCapturedGraph:
+        npu = torch.npu
+        static_inputs = tuple(value.detach().clone() for value in inputs)
+        if (
+            self._codec_sampler_penalty_tensor is None
+            or self._codec_sampler_penalty_tensor.device != static_inputs[0].device
+            or self._codec_sampler_penalty_tensor.dtype != torch.float32
+        ):
+            # Materialize the scalar before capture; torch.as_tensor(...,
+            # device="npu") inside capture performs a forbidden synchronous H2D.
+            self._codec_sampler_penalty_tensor = torch.tensor(
+                self._codec_repetition_penalty,
+                device=static_inputs[0].device,
+                dtype=torch.float32,
+            )
+        npu.synchronize()
+        graph = npu.NPUGraph()
+        # Give each alternating allow_eos graph an independent pool and never
+        # share workspace lifetime with the outer FULL_DECODE graph.
+        pool = npu.graph_pool_handle()
+        with torch.inference_mode(), npu.graph(graph, pool=pool):
+            output = self._codec_sampler_probabilities(
+                static_inputs[0], static_inputs[1], allow_eos=allow_eos
+            )
+        npu.synchronize()
+        return _CodecSamplerCapturedGraph(graph, pool, static_inputs, output)
+
+    def _run_codec_sampler_probabilities(
+        self,
+        hidden_state: torch.Tensor,
+        history: torch.Tensor,
+        *,
+        allow_eos: bool,
+    ) -> torch.Tensor:
+        if self._codec_sampler_graph_failed:
+            return self._codec_sampler_probabilities(
+                hidden_state, history, allow_eos=allow_eos
+            )
+        stream_capture_probe = getattr(torch.npu, "is_current_stream_capturing", None)
+        eligible = (
+            self._codec_sampler_graph_enabled
+            and hidden_state.device.type == "npu"
+            and history.device.type == "npu"
+            and hidden_state.device == history.device
+            and tuple(hidden_state.shape) == (1, int(self._hidden_size))
+            and tuple(history.shape) == (_REPETITION_WINDOW,)
+            and history.dtype == torch.long
+            and hidden_state.is_contiguous()
+            and history.is_contiguous()
+            and hasattr(torch, "npu")
+            and hasattr(torch.npu, "NPUGraph")
+            and hasattr(torch.npu, "graph")
+            and hasattr(torch.npu, "graph_pool_handle")
+            and callable(stream_capture_probe)
+            and not stream_capture_probe()
+        )
+        if not eligible:
+            return self._codec_sampler_probabilities(
+                hidden_state, history, allow_eos=allow_eos
+            )
+
+        key = (
+            allow_eos,
+            tuple(hidden_state.shape),
+            hidden_state.dtype,
+            hidden_state.device.index,
+            tuple(hidden_state.stride()),
+            tuple(history.shape),
+            history.dtype,
+            history.device.index,
+            tuple(history.stride()),
+        )
+        captured = self._codec_sampler_graphs.get(key)
+        inputs = (hidden_state, history)
+        if captured is not None:
+            self._codec_sampler_graph_hits += 1
+            first_key_replay = key not in self._codec_sampler_graph_replayed_keys
+            if first_key_replay:
+                self._codec_sampler_graph_replayed_keys.add(key)
+            if first_key_replay or self._codec_sampler_graph_hits % 1024 == 0:
+                logger.info(
+                    "MINICPMO45_CODEC_SAMPLER_NPUGRAPH event=replay "
+                    "hits=%d captures=%d allow_eos=%s first_key_replay=%s",
+                    self._codec_sampler_graph_hits,
+                    self._codec_sampler_graph_captures,
+                    allow_eos,
+                    first_key_replay,
+                )
+            return captured.replay(inputs)
+
+        # The current request remains eager.  Capture has no RNG operation, so
+        # executing the probability program a second time cannot consume an
+        # extra random draw.  Warmup absorbs the one-time synchronization.
+        eager = self._codec_sampler_probabilities(
+            hidden_state, history, allow_eos=allow_eos
+        )
+        try:
+            self._codec_sampler_graphs[key] = self._capture_codec_sampler_graph(
+                inputs, allow_eos=allow_eos
+            )
+        except Exception:
+            self._codec_sampler_graph_failed = True
+            self._codec_sampler_graph_enabled = False
+            logger.exception(
+                "MINICPMO45_CODEC_SAMPLER_NPUGRAPH event=capture_failed allow_eos=%s",
+                allow_eos,
+            )
+            logger.warning(
+                "Stage1 codec sampler NPU graph capture failed; continuing with "
+                "the selected eager sampler path"
+            )
+            return eager
+        self._codec_sampler_graph_captures += 1
+        logger.info(
+            "MINICPMO45_CODEC_SAMPLER_NPUGRAPH event=captured captures=%d allow_eos=%s",
+            self._codec_sampler_graph_captures,
+            allow_eos,
+        )
+        return eager
+
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -377,28 +602,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
-        eos_id = self._num_audio_tokens - 1
-        logits = _apply_repetition_penalty(
-            logits,
-            history,
-            penalty=self._codec_repetition_penalty,
-            window_size=_REPETITION_WINDOW,
-        )
         request_states = getattr(self, "_request_audio_states", {})
         state = request_states.get(request_id)
         min_tokens = (
-            int(state.get("min_tokens", self._codec_min_tokens)) if isinstance(state, dict) else self._codec_min_tokens
+            int(state.get("min_tokens", self._codec_min_tokens))
+            if isinstance(state, dict)
+            else self._codec_min_tokens
         )
-        if step < min_tokens:
-            logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
+        probabilities = self._run_codec_sampler_probabilities(
+            hidden_state,
+            history,
+            allow_eos=step >= min_tokens,
         )
-        probabilities = torch.softmax(logits, dim=-1)
         return torch.multinomial(
             probabilities,
             num_samples=1,
@@ -425,6 +640,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"MiniCPM-o continuous Talker received {len(sample_eligible)} sampling flags for {len(infos)} requests"
             )
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
+        # Sparse handoff is a C=1 non-duplex fast path. Unsupported runtime
+        # shapes must remain valid serving inputs, so fall back to dense output
+        # and flush any rows accumulated while the request was sparse.
+        sparse_output = (
+            self._sparse_chunk_frames > 0
+            and len(infos) == 1
+            and not emit_duplex_metadata
+        )
+        sparse_req_ids: list[str] = []
+        sparse_codec_deltas: list[torch.Tensor] = []
+        sparse_terminal_flags: list[torch.Tensor] = []
 
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
@@ -522,10 +748,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
             sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
-            sampled_id = int(sampled.item())
-            is_eos = sampled_id == self._num_audio_tokens - 1
             state["step"] = int(state.get("step", 0)) + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
+            # EOS is masked to -inf before min_tokens, and the hard-limit
+            # sample is discarded regardless. Keep the sampled token on the
+            # NPU in both cases instead of forcing a device-to-host fence.
+            if step < int(state.get("min_tokens", self._codec_min_tokens)) or reached_limit:
+                is_eos = False
+            else:
+                is_eos = int(sampled.item()) == self._num_audio_tokens - 1
             finished = is_eos or reached_limit
             state["finished"] = finished
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
@@ -542,13 +773,85 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "accumulated": codes,
             }
             codec_deltas.append(delta)
-            terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            terminal = torch.tensor(finished, dtype=torch.bool)
+            terminal_flags.append(terminal)
+            if sparse_output:
+                pending = state.setdefault("sparse_pending_codec_deltas", [])
+                if delta.numel():
+                    pending.append(delta)
+                if finished or len(pending) >= self._sparse_chunk_frames:
+                    if pending:
+                        sparse_delta = torch.cat(pending, dim=0)
+                        pending.clear()
+                    else:
+                        sparse_delta = empty_delta
+                    sparse_req_ids.append(request_id)
+                    sparse_codec_deltas.append(sparse_delta)
+                    sparse_terminal_flags.append(terminal)
+                    state["sparse_emits"] = int(state.get("sparse_emits", 0)) + 1
+                    self._sparse_emit_total += 1
+                    if self._sparse_emit_total == 1 or self._sparse_emit_total % 64 == 0:
+                        logger.info(
+                            "MINICPMO45_SPARSE_CHUNK event=emit emits=%d suppressed=%d rows=%d terminal=%s",
+                            self._sparse_emit_total,
+                            self._sparse_suppressed_total,
+                            int(sparse_delta.shape[0]),
+                            finished,
+                        )
+                else:
+                    state["sparse_suppressed"] = int(state.get("sparse_suppressed", 0)) + 1
+                    self._sparse_suppressed_total += 1
+                    if self._sparse_suppressed_total == 1 or self._sparse_suppressed_total % 1024 == 0:
+                        logger.info(
+                            "MINICPMO45_SPARSE_CHUNK event=suppress emits=%d suppressed=%d",
+                            self._sparse_emit_total,
+                            self._sparse_suppressed_total,
+                        )
+            else:
+                pending = state.get("sparse_pending_codec_deltas")
+                if isinstance(pending, list) and pending:
+                    pending_rows = [row for row in pending if isinstance(row, torch.Tensor)]
+                    if delta.numel():
+                        pending_rows.append(delta)
+                    codec_deltas[-1] = (
+                        torch.cat(pending_rows, dim=0) if pending_rows else empty_delta
+                    )
+                    pending.clear()
+            # The binary stop rows are immutable constants. Reuse them instead
+            # of allocating and copying a two-element NPU tensor every step.
+            row_attr = "_finished_stop_row" if finished else "_continue_stop_row"
+            row = getattr(self, row_attr)
+            if row is None or row.device != hidden.device or row.dtype != hidden.dtype:
+                row = hidden.new_tensor(
+                    [float("-inf"), 0.0] if finished else [0.0, float("-inf")]
+                )
+                setattr(self, row_attr, row)
+            stop_rows.append(row)
 
-        self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
+        if len(stop_rows) == 1:
+            # unsqueeze is a view; torch.stack would launch a copy for the
+            # overwhelmingly common single-concurrency serving path.
+            self._batch_stop_logits = stop_rows[0].unsqueeze(0)
+        elif stop_rows:
+            self._batch_stop_logits = torch.stack(stop_rows, dim=0)
+        else:
+            self._batch_stop_logits = hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
+        if sparse_output:
+            codec_deltas = sparse_codec_deltas
+            terminal_flags = sparse_terminal_flags
         meta_outputs = {"finished": terminal_flags}
+        if sparse_output:
+            # Reuse the existing VoxCPM2 sparse multimodal contract. req_id is
+            # compact and aligned with the compact payload lists; an empty list
+            # explicitly means this step has no downstream payload.
+            meta_outputs.update(
+                {
+                    "req_id": sparse_req_ids,
+                    "sparse_audio": ["1"],
+                }
+            )
         if emit_duplex_metadata:
             meta_outputs.update(
                 {
@@ -569,6 +872,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        if self._sparse_chunk_frames:
+            pending_rows = sum(
+                len(state.get("sparse_pending_codec_deltas", []))
+                for req_id, state in self._request_audio_states.items()
+                if req_id in finished_req_ids and isinstance(state, dict)
+            )
+            log_method = logger.error if pending_rows else logger.info
+            log_method(
+                "MINICPMO45_SPARSE_CHUNK event=finish emits=%d suppressed=%d finished=%d pending_rows=%d",
+                self._sparse_emit_total,
+                self._sparse_suppressed_total,
+                len(finished_req_ids),
+                pending_rows,
+            )
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
 
     def _flush_deferred_cleanup(self) -> None:
@@ -635,7 +952,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return logits
 
     def sample(self, logits, sampling_metadata):
-        return Sampler()(logits, sampling_metadata)
+        # The model emits a binary row containing exactly one finite value, so
+        # the standard sampler's temperature/processor/top-k machinery cannot
+        # change the selected token. The runner has already applied its logit
+        # bias (including caller-specified min_tokens), hence a direct argmax
+        # preserves serving semantics while avoiding the generic sampler path.
+        if (
+            sampling_metadata.max_num_logprobs is None
+            and not sampling_metadata.logprob_token_ids
+        ):
+            sampled = logits.argmax(dim=-1).to(torch.int32).unsqueeze(-1)
+            return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+        # The C=1 row is a view of a process-lifetime cached constant. Generic
+        # sampler processors may update logits in place, so isolate fallback
+        # requests (for example logprobs) from that cache.
+        return self._fallback_stop_sampler(logits.clone(), sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return self._load_native_weights(weights)

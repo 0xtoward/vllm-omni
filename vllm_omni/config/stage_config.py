@@ -625,7 +625,7 @@ def _merge_platforms(
     return merged
 
 
-def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
+def _resolve_deploy_yaml_raw(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
 
@@ -649,6 +649,51 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
         merged["platforms"] = merged_platforms
 
     return merged
+
+
+def _apply_minicpmo_4_5_npu_connector_defaults(
+    raw: dict[str, Any],
+    platform: str | None = None,
+) -> dict[str, Any]:
+    """Fill in MiniCPM-o 4.5's NPU connector defaults on a resolved deploy dict.
+
+    Applied here rather than on ``DeployConfig`` because the connector ``extra``
+    that reaches the Code2Wav model is built by ``load_omni_transfer_config_for_model``,
+    which re-reads the deploy file through this resolver and never sees a mutated
+    ``DeployConfig``. This is a default, not an override: a deploy file naming
+    ``token2wav_n_timesteps`` keeps whatever it names.
+    """
+    if not isinstance(raw, dict) or raw.get("pipeline") != "minicpmo_4_5":
+        return raw
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        device_name = current_omni_platform.device_name
+        platform = device_name.lower() if device_name is not None else None
+    if platform != "npu":
+        return raw
+    connectors = raw.get("connectors")
+    if not isinstance(connectors, dict):
+        return raw
+    for connector in connectors.values():
+        if not isinstance(connector, dict):
+            continue
+        extra = connector.setdefault("extra", {})
+        if not isinstance(extra, dict) or "token2wav_n_timesteps" in extra:
+            continue
+        extra["token2wav_n_timesteps"] = _MINICPMO_4_5_NPU_DENOISE_STEPS
+        logger.info(
+            "MiniCPM-o 4.5 Token2Wav denoise steps: %d (npu default)",
+            _MINICPMO_4_5_NPU_DENOISE_STEPS,
+        )
+    return raw
+
+
+def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
+    """Resolve a deploy YAML (with ``base_config`` inheritance) and apply
+    platform defaults, so every consumer of the resolved dict sees the same
+    values."""
+    return _apply_minicpmo_4_5_npu_connector_defaults(_resolve_deploy_yaml_raw(path))
 
 
 def load_deploy_config(path: str | Path) -> DeployConfig:
@@ -882,6 +927,62 @@ def _build_extras(
     return extras
 
 
+# MiniCPM-o 4.5 ships both of its NPU decode stages -- the Thinker (stage 0) and
+# the Talker (stage 1) -- declared PIECEWISE in the deploy file, so every decode
+# step pays per-operator launch overhead instead of replaying one graph.
+# Measured on Ascend 910C at single concurrency: promoting the Talker is worth
+# 3.1% of RTF at 10 Token2Wav denoise steps and 17.6% at 4 -- the gain scales
+# with how much of the critical path the Talker owns -- and promoting the
+# Thinker cuts TTFT 7.1%. Both are pure scheduling changes, same kernels and
+# same numerics, so neither trades against output quality.
+_MINICPMO_4_5_NPU_FULL_DECODE_STAGE_IDS = frozenset({0, 1})
+_MINICPMO_4_5_SHIPPED_GRAPH_MODE = "PIECEWISE"
+# CFM denoise steps for Token2Wav. The reference default is 10. On Ascend NPU
+# the Token2Wav chunk is launch-bound -- device time tracks kernel count 1:1 at
+# 1.5-4% core occupancy -- so chunk cost is close to linear in the step count,
+# and 4 is the lowest setting measured to still clear the quality gates on 910C
+# (zh CER 1.098% against a 1.414% gate, ASV SIM 0.846, en WER 1.071%). It is set
+# here rather than in the model module because editing a model module changes
+# its source hash and invalidates vLLM's modelinfos cache.
+_MINICPMO_4_5_NPU_DENOISE_STEPS = 4
+
+
+def _apply_minicpmo_4_5_npu_graph_defaults(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    platform: str | None = None,
+) -> None:
+    """Promote MiniCPM-o 4.5's NPU decode stages to ``FULL_DECODE_ONLY``.
+
+    Only stages still carrying the shipped ``PIECEWISE`` value are upgraded: a
+    deploy file naming any other mode is expressing a deliberate choice, and a
+    stage naming no mode at all keeps whatever the engine defaults to.
+    """
+    if pipeline.model_type != "minicpmo_4_5":
+        return
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        device_name = current_omni_platform.device_name
+        platform = device_name.lower() if device_name is not None else None
+    if platform != "npu":
+        return
+    for stage in deploy.stages:
+        if stage.stage_id not in _MINICPMO_4_5_NPU_FULL_DECODE_STAGE_IDS:
+            continue
+        compilation = stage.compilation_config
+        if not isinstance(compilation, dict):
+            continue
+        if compilation.get("cudagraph_mode") != _MINICPMO_4_5_SHIPPED_GRAPH_MODE:
+            continue
+        stage.compilation_config = {**compilation, "cudagraph_mode": "FULL_DECODE_ONLY"}
+        logger.info(
+            "MiniCPM-o 4.5 stage %s: cudagraph_mode %s -> FULL_DECODE_ONLY (npu default)",
+            stage.stage_id,
+            _MINICPMO_4_5_SHIPPED_GRAPH_MODE,
+        )
+
+
 def merge_pipeline_deploy(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
@@ -892,6 +993,7 @@ def merge_pipeline_deploy(
         cli_overrides = {}
 
     deploy = _apply_platform_overrides(deploy)
+    _apply_minicpmo_4_5_npu_graph_defaults(pipeline, deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # async_chunk is irrelevant for single-stage pipelines, so we always disable it
