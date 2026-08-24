@@ -940,11 +940,12 @@ _MINICPMO_4_5_SHIPPED_GRAPH_MODE = "PIECEWISE"
 # CFM denoise steps for Token2Wav. The reference default is 10. On Ascend NPU
 # the Token2Wav chunk is launch-bound -- device time tracks kernel count 1:1 at
 # 1.5-4% core occupancy -- so chunk cost is close to linear in the step count,
-# and 4 is the lowest setting measured to still clear the quality gates on 910C
-# (zh CER 1.098% against a 1.414% gate, ASV SIM 0.846, en WER 1.071%). It is set
+# This diagnostic branch changes only the already-gated denoise count from 4
+# to 3 so the official single-die service can isolate CFM3 from scheduler,
+# connector, sparse-output, placement, allocator, or other all-in changes.
 # here rather than in the model module because editing a model module changes
 # its source hash and invalidates vLLM's modelinfos cache.
-_MINICPMO_4_5_NPU_DENOISE_STEPS = 4
+_MINICPMO_4_5_NPU_DENOISE_STEPS = 3
 
 
 def _apply_minicpmo_4_5_npu_graph_defaults(
