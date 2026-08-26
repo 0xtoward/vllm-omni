@@ -19,10 +19,26 @@ def _parse_linux_cpu_list(value: str) -> set[int]:
     return cpus
 
 
+def _format_linux_cpu_list(cpus: set[int]) -> str:
+    """Format a CPU set using Linux's compact ``Cpus_allowed_list`` syntax."""
+    if not cpus:
+        return ""
+    values = sorted(cpus)
+    ranges: list[str] = []
+    first = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(first) if first == previous else f"{first}-{previous}")
+        first = previous = value
+    ranges.append(str(first) if first == previous else f"{first}-{previous}")
+    return ",".join(ranges)
+
+
 def _select_local_numa_cpuset(
     allowed: set[int],
     node_cpus: dict[int, set[int]],
-    preferred_node: int | None = None,
 ) -> tuple[int, set[int]] | None:
     """Choose one NUMA-local subset without escaping the inherited cpuset."""
     candidates = {
@@ -30,8 +46,6 @@ def _select_local_numa_cpuset(
     }
     if not candidates:
         return None
-    if preferred_node is not None and preferred_node in candidates:
-        return preferred_node, candidates[preferred_node]
     node = min(candidates, key=lambda item: (-len(candidates[item]), item))
     return node, candidates[node]
 
@@ -49,26 +63,87 @@ def _limit_minicpmo45_npu_to_local_cpuset() -> None:
     from pathlib import Path
 
     if os.environ.get("MINICPMO45_NO_NUMA_AFFINITY") == "1":
+        print(
+            "[minicpmo45-numa] disabled by MINICPMO45_NO_NUMA_AFFINITY=1",
+            file=sys.stderr,
+            flush=True,
+        )
         return
     allowed = set(os.sched_getaffinity(0))
+    if not allowed:
+        raise RuntimeError("MiniCPM-o NUMA setup found an empty inherited CPU set")
     node_cpus: dict[int, set[int]] = {}
-    for path_value in glob.glob("/sys/devices/system/node/node*/cpulist"):
+    discovery_errors: list[str] = []
+    for path_value in sorted(
+        glob.glob("/sys/devices/system/node/node*/cpulist")
+    ):
         path = Path(path_value)
         suffix = path.parent.name.removeprefix("node")
         if suffix.isdigit():
-            node_cpus[int(suffix)] = _parse_linux_cpu_list(path.read_text())
-    preferred = os.environ.get("MINICPMO45_NUMA_NODE")
-    selected = _select_local_numa_cpuset(
-        allowed,
-        node_cpus,
-        int(preferred) if preferred is not None else None,
-    )
+            try:
+                node_cpus[int(suffix)] = _parse_linux_cpu_list(
+                    path.read_text()
+                )
+            except (OSError, ValueError) as exc:
+                discovery_errors.append(
+                    f"{path_value}:{type(exc).__name__}"
+                )
+    selected = _select_local_numa_cpuset(allowed, node_cpus)
     if selected is None:
-        return
+        error_suffix = (
+            f"; discovery_errors={','.join(discovery_errors)}"
+            if discovery_errors
+            else ""
+        )
+        raise RuntimeError(
+            "MiniCPM-o NUMA setup could not intersect the inherited CPU set "
+            "with /sys/devices/system/node/node*/cpulist"
+            f"{error_suffix}"
+        )
     node, cpus = selected
+    status = "preserved" if cpus == allowed else "applied"
     if cpus != allowed:
         os.sched_setaffinity(0, cpus)
+    effective = set(os.sched_getaffinity(0))
+    if effective != cpus:
+        raise RuntimeError(
+            "MiniCPM-o NUMA affinity verification failed: "
+            f"requested={_format_linux_cpu_list(cpus)} "
+            f"effective={_format_linux_cpu_list(effective)}"
+        )
+    effective_nodes = {
+        candidate_node
+        for candidate_node, candidate_cpus in node_cpus.items()
+        if effective & candidate_cpus
+    }
+    if effective_nodes != {node}:
+        raise RuntimeError(
+            "MiniCPM-o NUMA affinity is not local to exactly one node: "
+            f"selected={node} effective_nodes={sorted(effective_nodes)}"
+        )
     os.environ["_MINICPMO45_NUMA_AFFINITY"] = f"node{node}:{len(cpus)}"
+    os.environ["_MINICPMO45_NUMA_INHERITED_CPUSET"] = _format_linux_cpu_list(
+        allowed
+    )
+    os.environ["_MINICPMO45_NUMA_EFFECTIVE_CPUSET"] = _format_linux_cpu_list(
+        effective
+    )
+    print(
+        "[minicpmo45-numa] "
+        f"status={status} "
+        f"inherited={_format_linux_cpu_list(allowed)} "
+        f"selected=node{node} effective={_format_linux_cpu_list(effective)} "
+        "owner=vllm-ascend-native-binder",
+        file=sys.stderr,
+        flush=True,
+    )
+    if discovery_errors:
+        print(
+            "[minicpmo45-numa] ignored discovery errors: "
+            + ",".join(discovery_errors),
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _maybe_prepare_minicpmo45_npu_runtime() -> None:
