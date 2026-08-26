@@ -2628,3 +2628,24 @@ def test_ar_runner_applies_duplex_sampling_before_the_model_sampler(class_name: 
         f"{_MODEL_SAMPLER_CALL}() at line {sampler_lineno}.  The hook masks the logits and publishes the "
         f"row -> session map the sampler reads, so running it afterwards is a silent no-op."
     )
+
+
+def test_npu_sparse_marker_routes_intermediate_generation_payloads() -> None:
+    """A sparse marker is authoritative before the final audio stage.
+
+    MiniCPM's Talker is an intermediate generation stage.  Restricting sparse
+    routing to ``engine_output_type == "audio"`` leaves suppressed steps with
+    an empty compact payload and later indexes ``element[0]``.
+    """
+    import ast
+
+    classdef, path = _ar_runner_classdefs()["NPUARModelRunner"]
+    method = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens"
+    )
+    source = ast.unparse(method)
+    assert "if sparse_mm_req_ids is not None:" in source, path
+    assert "audio_sparse_output = sparse_mm_req_ids is not None" in source, path
+    assert 'engine_output_type == "audio" and sparse_mm_req_ids' not in source, path

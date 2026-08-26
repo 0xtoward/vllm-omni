@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
@@ -18,6 +19,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.utils import record_function_or_nullcontext
@@ -46,6 +48,19 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
+        async_output_d2h_requested = (
+            os.environ.get("VLLM_OMNI_MINICPMO45_STAGE2_ASYNC_OUTPUT_D2H", "0") == "1"
+            and getattr(self.model_config, "model_arch", None) == "MiniCPMO45Code2Wav"
+            and self.use_async_scheduling
+        )
+        self._async_output_d2h = async_output_d2h_requested and is_pin_memory_available()
+        self._async_output_d2h_copies = 0
+        if async_output_d2h_requested:
+            logger.info(
+                "MiniCPM-o Stage2 async output D2H requested: enabled=%s pin_memory=%s",
+                self._async_output_d2h,
+                is_pin_memory_available(),
+            )
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -488,6 +503,38 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         self.execute_model_state = None
 
         #  -------------------------------------- Omni-new -------------------------------------------------
+        # The regular path calls ``to('cpu')`` here, which turns the first host
+        # access after Code2Wav into a default-stream fence.  In async scheduling
+        # mode, stage the final payload on the already-existing output copy stream
+        # and let AsyncGPUModelRunnerOutput's ready event guard CPU consumption.
+        # Keep the source tensors alive until that event fires; MiniCPM's final
+        # waveform is produced after the resident CFM graph and is not a graph-
+        # owned output buffer, so retaining the tensor is sufficient (no clone).
+        async_d2h_sources: list[torch.Tensor] = []
+        async_d2h_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def to_cpu_contiguous(out: torch.Tensor) -> torch.Tensor:
+            out = out.detach()
+            if not self._async_output_d2h or out.device.type == "cpu":
+                return out.to("cpu").contiguous()
+            source = out.contiguous()
+            destination = torch.empty(
+                source.shape,
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            async_d2h_sources.append(source)
+            async_d2h_copies.append((destination, source))
+            self._async_output_d2h_copies += 1
+            if self._async_output_d2h_copies == 1:
+                logger.info(
+                    "MiniCPM-o Stage2 async output D2H engaged: shape=%s dtype=%s",
+                    tuple(source.shape),
+                    source.dtype,
+                )
+            return destination
+
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
         per_req_payloads: list[dict[str, object]] = []
@@ -497,14 +544,14 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             )
             assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
+                per_req_payloads.append({"model_outputs": to_cpu_contiguous(multimodal_outputs_raw[i])})
         elif isinstance(multimodal_outputs_raw, list):
             assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
             for out in multimodal_outputs_raw:
                 per_req_payloads.append(
-                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+                    {"model_outputs": to_cpu_contiguous(out) if out is not None else None}
                 )
         elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
@@ -517,14 +564,21 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                                 f"Multimodal output list for key '{key}' has length {len(out)} "
                                 f"but expected {num_reqs} (one entry per request)."
                             )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                        mm_payload[key] = to_cpu_contiguous(out[i])
                     elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = out.detach().to("cpu").contiguous()
+                        mm_payload[key] = to_cpu_contiguous(out)
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
                 per_req_payloads.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
+
+        if async_d2h_copies:
+            default_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(self.async_output_copy_stream):
+                self.async_output_copy_stream.wait_stream(default_stream)
+                for destination, source in async_d2h_copies:
+                    destination.copy_(source, non_blocking=True)
 
         if self._async_chunk:
             inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
@@ -588,6 +642,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             vocab_size=self.input_batch.vocab_size,
             logprobs_tensors=None,
         )
+        # The ready event above is recorded on the same stream after the payload
+        # copies, so these references can be released with the async output.
+        if async_d2h_sources:
+            async_output._omni_async_d2h_sources = async_d2h_sources
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,

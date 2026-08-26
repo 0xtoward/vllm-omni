@@ -679,13 +679,26 @@ def _apply_minicpmo_4_5_npu_connector_defaults(
         if not isinstance(connector, dict):
             continue
         extra = connector.setdefault("extra", {})
-        if not isinstance(extra, dict) or "token2wav_n_timesteps" in extra:
+        if not isinstance(extra, dict):
             continue
-        extra["token2wav_n_timesteps"] = _MINICPMO_4_5_NPU_DENOISE_STEPS
-        logger.info(
-            "MiniCPM-o 4.5 Token2Wav denoise steps: %d (npu default)",
-            _MINICPMO_4_5_NPU_DENOISE_STEPS,
-        )
+        defaults = {
+            "token2wav_n_timesteps": _MINICPMO_4_5_NPU_DENOISE_STEPS,
+            "code2wav_npu_graph_mode": _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_MODE,
+            "code2wav_npu_graph_profile": _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROFILE,
+            "code2wav_npu_graph_prompt_manifest_mode": (
+                _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROMPT_MODE
+            ),
+        }
+        applied: dict[str, Any] = {}
+        for key, value in defaults.items():
+            if key not in extra:
+                extra[key] = value
+                applied[key] = value
+        if applied:
+            logger.info(
+                "MiniCPM-o 4.5 Token2Wav NPU defaults: %s",
+                applied,
+            )
     return raw
 
 
@@ -946,6 +959,11 @@ _MINICPMO_4_5_SHIPPED_GRAPH_MODE = "PIECEWISE"
 # here rather than in the model module because editing a model module changes
 # its source hash and invalidates vLLM's modelinfos cache.
 _MINICPMO_4_5_NPU_DENOISE_STEPS = 3
+_MINICPMO_4_5_NPU_CODE2WAV_GRAPH_MODE = "on"
+_MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROFILE = (
+    "cfm3_ccf25_b1_model_default_prompt_v1"
+)
+_MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROMPT_MODE = "model_default"
 
 
 def _apply_minicpmo_4_5_npu_graph_defaults(

@@ -10,9 +10,24 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _freeze_parametrized_weights_for_inference,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_freeze_parametrized_weights_materializes_exact_weight_once() -> None:
+    module = nn.Sequential(
+        nn.utils.parametrizations.weight_norm(nn.Conv1d(4, 6, 3), dim=0),
+        nn.ReLU(),
+    )
+    conv = module[0]
+    expected = conv.weight.detach().clone()
+
+    assert _freeze_parametrized_weights_for_inference(module) == 1
+    assert not nn.utils.parametrize.is_parametrized(conv, "weight")
+    assert torch.equal(conv.weight, expected)
+    assert _freeze_parametrized_weights_for_inference(module) == 0
 
 
 class _FakeEncoder(nn.Module):
@@ -160,6 +175,28 @@ def _model():
     model = MiniCPMO45Code2Wav(vllm_config=_config())
     model.backend = backend
     return model, token2wav
+
+
+def test_model_default_graph_prompt_does_not_require_runtime_manifest():
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(
+        code2wav_npu_graph_mode="runtime_only",
+        code2wav_npu_graph_prompt_manifest_mode="model_default",
+    )
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._runtime_prompt_manifest is None
+
+
+def test_unknown_graph_prompt_manifest_mode_is_rejected():
+    config = _config()
+    config.model_config.stage_connector_config["extra"][
+        "code2wav_npu_graph_prompt_manifest_mode"
+    ] = "typo"
+
+    with pytest.raises(ValueError, match="invalid runtime prompt manifest mode"):
+        MiniCPMO45Code2Wav(vllm_config=config)
 
 
 def test_adapter_releases_unused_upstream_streaming_buffers():

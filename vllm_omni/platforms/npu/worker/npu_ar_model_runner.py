@@ -1059,14 +1059,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
         sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
-        if engine_output_type == "audio" and sparse_mm_req_ids is not None:
+        if sparse_mm_req_ids is not None:
             sparse_req_id_set = set(sparse_mm_req_ids)
             downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
+        audio_sparse_output = sparse_mm_req_ids is not None
         needs_scheduled_hidden_payload = needs_pooler_payload and (
             self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
         )

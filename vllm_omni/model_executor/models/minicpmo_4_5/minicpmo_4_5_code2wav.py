@@ -31,6 +31,34 @@ from .runtime_prompt_manifest import RuntimePromptManifest
 logger = init_logger(__name__)
 
 
+def _freeze_parametrized_weights_for_inference(module: nn.Module) -> int:
+    """Materialize inference-only weight parametrizations exactly once.
+
+    StepAudio2's HiFT checkpoint uses PyTorch weight normalization.  Leaving
+    the parametrization installed recomputes the same convolution weights on
+    every streaming chunk.  At inference time the underlying parameters are
+    immutable, so replacing each parametrization by its current value is
+    mathematically equivalent and makes the convolution weight storage stable.
+    """
+    from torch.nn.utils import parametrize
+
+    frozen = 0
+    for submodule in module.modules():
+        if not parametrize.is_parametrized(submodule, "weight"):
+            continue
+        expected = submodule.weight.detach().clone()
+        parametrize.remove_parametrizations(
+            submodule,
+            "weight",
+            leave_parametrized=True,
+        )
+        actual = submodule.weight.detach()
+        if not torch.equal(expected, actual):
+            raise RuntimeError("HiFT weight-norm materialization changed a weight tensor")
+        frozen += 1
+    return frozen
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -138,7 +166,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         extra = self._extra_config()
         manifest_mode = str(extra.get("code2wav_npu_graph_prompt_manifest_mode", "off")).strip().lower()
         self._runtime_prompt_manifest: RuntimePromptManifest | None = None
-        if manifest_mode != "off":
+        if manifest_mode not in {"off", "model_default", "producer", "consumer"}:
+            raise ValueError(f"invalid runtime prompt manifest mode: {manifest_mode!r}")
+        # ``model_default`` is a graph-startup census mode.  It hashes and
+        # preprocesses the model-owned HT_ref_audio.wav directly and therefore
+        # must not construct the producer/consumer manifest state machine.
+        if manifest_mode in {"producer", "consumer"}:
             graph_mode = str(extra.get("code2wav_npu_graph_mode", "off")).lower()
             if manifest_mode == "producer" and graph_mode != "off":
                 raise ValueError("runtime prompt producer must run with code2wav graph mode=off")
@@ -826,6 +859,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
+        freeze_hift_weight_norm = str(
+            os.environ.get(
+                "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",
+                "0",
+            )
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if current_omni_platform.is_npu() and freeze_hift_weight_norm:
+            frozen = _freeze_parametrized_weights_for_inference(token2wav.hift)
+            if frozen <= 0:
+                raise RuntimeError("HiFT weight-norm materialization found no parametrized weights")
+            logger.info("Materialized %d HiFT weight-norm tensors for inference", frozen)
         self.backend = BatchedToken2Wav(token2wav)
         if graph_bootstrap is not None:
             graph_bootstrap.install_instance_hooks_and_warm(self.backend)

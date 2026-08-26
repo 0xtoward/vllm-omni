@@ -11,24 +11,34 @@
 - final mel、每步 CNN/attention cache、CFG/Euler 状态 exact；
 - 启动期 shadow 通过后封图，请求期不 capture；unknown role/tail 计数后 eager fallback；
 - trace 中 `LaunchKernelV2` 从 `55,527 / 239.717 ms` 降到 `20,860 / 89.210 ms`；
-- E2E 是小幅正向候选，但低于 2% conservative-winner 集成门。因此本包提供完整实现，默认仍为 `off`。
+- 两对 matched `runtime_only/on`：mean RTF `0.267091 -> 0.253190`
+  （-5.20%）、TTFP -3.46%、E2EL -4.99%。每个 on arm 31 次正式请求
+  replay，四个 role 均命中，所有 miss/failure/external-load 为0；因此已进入
+  最终默认 winner。
 
 ## 配置合同
 
-Stage2 `extra` 需要：
+最终 MiniCPM-o 4.5 NPU 缺省合同为：
 
 ```yaml
 code2wav_npu_graph_mode: on
 code2wav_npu_graph_profile: cfm3_ccf25_b1_model_default_prompt_v1
-code2wav_npu_graph_prompt_manifest_mode: consumer
-code2wav_npu_graph_prompt_manifest: /absolute/path/to/sealed-runtime-prompts.json
-code2wav_npu_graph_prompt_manifest_sha256: <64-hex-sha256>
+code2wav_npu_graph_prompt_manifest_mode: model_default
 ```
 
-硬合同：CFM3、`codec_chunk_frames=25`、left context 3、B=1、一个已封 runtime prompt 长度。`runtime_only` 使用同一内部格式/SDPA 路径但不 capture，可作为 matched control。
+硬合同：CFM3、`codec_chunk_frames=25`、left context 3、B=1、模型默认
+`HT_ref_audio.wav` 的 prompt 长度/内容 SHA。`runtime_only` 使用同一内部
+格式/SDPA 路径但不 capture，可作为 matched control。官方 deploy 显式给出的
+`off`、其他步数、profile 或 manifest 配置始终优先，不被缺省值覆盖。
 
-producer 必须用 `code2wav_npu_graph_mode: off` 和 `code2wav_npu_graph_prompt_manifest_mode: producer` 观察真实 prompt；consumer 只读 sealed manifest。路径和 SHA 不匹配时 fail closed，不会请求期偷偷扩图。
+需要运行期自定义参考音频时，仍可使用 producer/consumer sealed manifest：
+producer 只观察 prompt，consumer 只读路径与 SHA。任何合同不匹配均 fail closed，
+不会在正式请求期偷偷 capture。
 
-## 本轮限制
+## 最终 fresh-copy 验收
 
-本轮按要求未启动服务、未占用 NPU。代码是此前已完成 NPU correctness/engagement/E2E 的原实现逐文件迁移；本轮只执行静态、AST、CPU 合同测试与打包检查。官方环境没有 portable 的绝对 prompt-manifest 路径，因此不把 graph 强制设为默认 ON。
+从独立 candidate source 复制并 `pip install -e . --no-build-isolation` 后，
+使用逐字节未改的官方 deploy YAML，图自动完成 4 个 role capture、5/5 shadow
+checks，并在正式请求 replay 31 次；最终源码（含真实 NUMA re-exec）RTF
+`0.256868`、TTFP `653.568 ms`、TTFT `345.352 ms`，4/4 成功。Stage1
+paged GE mentions=0。

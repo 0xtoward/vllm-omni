@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
@@ -54,11 +55,17 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     nn.Module.__init__(talker)
     talker._num_audio_tokens = 8
     talker._batch_stop_logits = None
+    talker._continue_stop_row = None
+    talker._finished_stop_row = None
+    talker._fallback_stop_sampler = Sampler()
     talker._request_generators = {}
     talker._request_audio_states = {}
     talker._deferred_cleanup_ids = set()
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
+    talker._sparse_chunk_frames = 0
+    talker._sparse_emit_total = 0
+    talker._sparse_suppressed_total = 0
     return talker
 
 
@@ -231,6 +238,119 @@ def test_incomplete_prefill_emits_no_code_and_does_not_advance_state(mocker) -> 
     assert infos[1]["audio_state"]["step"] == 5
     assert _routed(output, 0)["codes"]["audio"].shape == (0, 1)
     assert _routed(output, 1)["codes"]["audio"].tolist() == [[2]]
+
+
+def test_codec_proposal_is_invisible_until_one_atomic_commit(monkeypatch) -> None:
+    talker = _make_talker()
+    sample_calls = []
+
+    def sample(*args, **kwargs):
+        sample_calls.append((args, kwargs))
+        return torch.tensor(3, dtype=torch.long)
+
+    monkeypatch.setattr(talker, "_sample_audio_code", sample)
+    codes = torch.tensor([4, 5], dtype=torch.long)
+    state = {
+        "step": 7,
+        "finished": False,
+        "codes": codes,
+    }
+    info = {
+        "request_id": "req-atomic",
+        "audio_state": state,
+        "audio_codes": {"accumulated": codes},
+    }
+    state_before = dict(state)
+    audio_codes_before = dict(info["audio_codes"])
+    empty_delta = torch.empty((0, 1), dtype=torch.long)
+
+    proposal = talker._propose_codec(
+        torch.ones(1, 2),
+        codes,
+        request_id="req-atomic",
+        step=7,
+        min_tokens=50,
+        max_tokens=64,
+    )
+    commit = talker._resolve_codec_proposal(
+        proposal,
+        empty_delta=empty_delta,
+    )
+
+    assert len(sample_calls) == 1
+    assert state == state_before
+    assert info["audio_codes"] == audio_codes_before
+    assert commit.finished is False
+    assert commit.codec_delta.tolist() == [[3]]
+
+    delta, terminal, sparse_delta = talker._commit_codec_prefix(
+        info=info,
+        state=state,
+        commit=commit,
+        sparse_output=False,
+        empty_delta=empty_delta,
+    )
+
+    assert delta.tolist() == [[3]]
+    assert terminal.item() is False
+    assert sparse_delta is None
+    assert state["step"] == 8
+    assert state["finished"] is False
+    assert state["codes"].tolist() == [4, 5, 3]
+    assert info["audio_codes"]["current"].tolist() == [3]
+
+    with pytest.raises(RuntimeError, match="stale or duplicated"):
+        talker._commit_codec_prefix(
+            info=info,
+            state=state,
+            commit=commit,
+            sparse_output=False,
+            empty_delta=empty_delta,
+        )
+
+
+@pytest.mark.parametrize(
+    ("sampled", "step", "min_tokens", "max_tokens", "finished", "kept"),
+    [
+        (7, 50, 50, 64, True, [4, 5]),
+        (3, 63, 50, 64, True, [4, 5]),
+        (7, 3, 50, 64, False, [4, 5, 7]),
+    ],
+)
+def test_codec_resolve_preserves_eos_minimum_and_limit_contract(
+    monkeypatch,
+    sampled,
+    step,
+    min_tokens,
+    max_tokens,
+    finished,
+    kept,
+) -> None:
+    talker = _make_talker()
+    monkeypatch.setattr(
+        talker,
+        "_sample_audio_code",
+        lambda *_args, **_kwargs: torch.tensor(sampled, dtype=torch.long),
+    )
+    codes = torch.tensor([4, 5], dtype=torch.long)
+    proposal = talker._propose_codec(
+        torch.ones(1, 2),
+        codes,
+        request_id="req-boundary",
+        step=step,
+        min_tokens=min_tokens,
+        max_tokens=max_tokens,
+    )
+
+    commit = talker._resolve_codec_proposal(
+        proposal,
+        empty_delta=torch.empty((0, 1), dtype=torch.long),
+    )
+
+    assert commit.step_after == step + 1
+    assert commit.finished is finished
+    assert commit.codes_after.tolist() == kept
+    assert commit.codec_delta.shape[0] == (0 if finished else 1)
 
 
 def test_eos_is_terminal_once_and_never_enters_codec_history(mocker) -> None:

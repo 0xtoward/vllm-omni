@@ -497,6 +497,19 @@ def test_runtime_prompt_manifest_is_hash_verified_and_model_default_only(tmp_pat
         )
 
 
+def test_model_default_prompt_mode_uses_exact_model_asset(tmp_path):
+    prompt = tmp_path / "HT_ref_audio.wav"
+    prompt.write_bytes(b"RIFF" + b"\0" * 32)
+    specs = graph_impl._parse_prompt_wav_specs(
+        {graph_impl._PROMPT_MANIFEST_MODE_KEY: "model_default"},
+        model_default_prompt=str(prompt),
+    )
+    assert len(specs) == 1
+    assert specs[0].path == str(prompt.resolve())
+    assert specs[0].sha256 == hashlib.sha256(prompt.read_bytes()).hexdigest()
+    assert specs[0].manifest_row == {}
+
+
 def test_file_prompt_path_seals_and_consumer_verifies_exact_features(tmp_path):
     metadata = tmp_path / "meta.lst"
     metadata.write_text("fixed rows\n")
@@ -610,6 +623,33 @@ def test_prompt_census_deduplicates_only_by_real_prompt_length():
     assert [row.prompt_frames for row, _ in rows] == [302]
     assert bootstrap._allowed_prompt_frames == {302}
     assert len(bootstrap._expected_roles) == 4
+
+
+def test_prompt_census_accepts_model_default_without_external_manifest():
+    bootstrap = graph_impl.Stage2EstimatorGraphBootstrap(
+        SimpleNamespace(),
+        mode="on",
+        profile=graph_impl._CERTIFIED_PROFILE,
+    )
+    bootstrap._prompt_specs = (
+        graph_impl._PromptWavSpec(
+            path="/model/HT_ref_audio.wav",
+            sha256="0" * 64,
+            manifest_row={},
+        ),
+    )
+
+    class _Backend:
+        def prepare_prompt(self, cache_id, path):
+            del cache_id, path
+            return SimpleNamespace(mels=torch.zeros((1, 302, 80)))
+
+        def evict_prompt(self, cache_id, path):
+            del cache_id, path
+
+    rows = bootstrap._build_prompt_census(_Backend())
+    assert [row.prompt_frames for row, _ in rows] == [302]
+    assert bootstrap._allowed_prompt_frames == {302}
 
 
 def test_sealed_resident_fingerprint_ignores_replay_count_but_not_roles():

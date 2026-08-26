@@ -36,6 +36,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    _apply_minicpmo_4_5_npu_connector_defaults,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -59,6 +60,53 @@ def _load_default_deploy(pipeline: PipelineConfig) -> DeployConfig:
     if pipeline.default_deploy_config_name is not None:
         return load_deploy_config(_DEPLOY_DIR / pipeline.default_deploy_config_name)
     return DeployConfig()
+
+
+def test_minicpmo45_npu_connector_defaults_enable_certified_cfm3_graph():
+    raw = {
+        "pipeline": "minicpmo_4_5",
+        "connectors": {
+            "shared": {
+                "name": "SharedMemoryConnector",
+                "extra": {"codec_chunk_frames": 25},
+            }
+        },
+    }
+
+    resolved = _apply_minicpmo_4_5_npu_connector_defaults(raw, platform="npu")
+    extra = resolved["connectors"]["shared"]["extra"]
+
+    assert extra["token2wav_n_timesteps"] == 3
+    assert extra["code2wav_npu_graph_mode"] == "on"
+    assert extra["code2wav_npu_graph_profile"] == (
+        "cfm3_ccf25_b1_model_default_prompt_v1"
+    )
+    assert extra["code2wav_npu_graph_prompt_manifest_mode"] == "model_default"
+
+
+def test_minicpmo45_npu_connector_defaults_preserve_explicit_opt_out():
+    raw = {
+        "pipeline": "minicpmo_4_5",
+        "connectors": {
+            "shared": {
+                "name": "SharedMemoryConnector",
+                "extra": {
+                    "token2wav_n_timesteps": 10,
+                    "code2wav_npu_graph_mode": "off",
+                    "code2wav_npu_graph_profile": "custom",
+                    "code2wav_npu_graph_prompt_manifest_mode": "off",
+                },
+            }
+        },
+    }
+
+    resolved = _apply_minicpmo_4_5_npu_connector_defaults(raw, platform="npu")
+    extra = resolved["connectors"]["shared"]["extra"]
+
+    assert extra["token2wav_n_timesteps"] == 10
+    assert extra["code2wav_npu_graph_mode"] == "off"
+    assert extra["code2wav_npu_graph_profile"] == "custom"
+    assert extra["code2wav_npu_graph_prompt_manifest_mode"] == "off"
 
 
 def _resolve_pipeline_or_skip(model_type: str, hf_config=None) -> PipelineConfig:

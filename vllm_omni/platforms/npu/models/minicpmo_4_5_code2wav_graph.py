@@ -99,9 +99,30 @@ def _roles_for_prompt_frames(prompt_frames: int) -> frozenset[str]:
     )
 
 
-def _parse_prompt_wav_specs(extra: Mapping[str, Any]) -> tuple[_PromptWavSpec, ...]:
-    if str(extra.get(_PROMPT_MANIFEST_MODE_KEY, "")).lower() != "consumer":
-        raise RuntimeError("MiniCPM-o Stage2 graph requires prompt manifest mode=consumer")
+def _parse_prompt_wav_specs(
+    extra: Mapping[str, Any],
+    *,
+    model_default_prompt: str = "",
+) -> tuple[_PromptWavSpec, ...]:
+    manifest_mode = str(extra.get(_PROMPT_MANIFEST_MODE_KEY, "")).lower()
+    if manifest_mode == "model_default":
+        source = Path(model_default_prompt).expanduser()
+        if not source.is_absolute():
+            raise RuntimeError("MiniCPM-o Stage2 model-default prompt path must be absolute")
+        path = source.resolve(strict=True)
+        if not path.is_file() or path.suffix.lower() != ".wav":
+            raise RuntimeError(f"MiniCPM-o Stage2 model-default prompt is not a regular WAV: {path}")
+        return (
+            _PromptWavSpec(
+                path=str(path),
+                sha256=_file_sha256(path),
+                manifest_row={},
+            ),
+        )
+    if manifest_mode != "consumer":
+        raise RuntimeError(
+            "MiniCPM-o Stage2 graph requires prompt manifest mode=consumer/model_default"
+        )
     path_raw = str(extra.get(_PROMPT_MANIFEST_KEY, "")).strip()
     expected_sha = str(extra.get(_PROMPT_MANIFEST_SHA_KEY, "")).strip().lower()
     if not path_raw or not Path(path_raw).is_absolute() or len(expected_sha) != 64:
@@ -790,7 +811,7 @@ class Stage2EstimatorGraphBootstrap:
                 actual_shape = list(features.mels.shape)
                 expected_mel_sha = str(spec.manifest_row.get("prompt_mel_sha256", ""))
                 actual_mel_sha = tensor_sha256(features.mels)
-                if (
+                if spec.manifest_row and (
                     prompt_frames != int(spec.manifest_row.get("prompt_frames", -1))
                     or actual_shape != expected_shape
                     or actual_mel_sha != expected_mel_sha
@@ -1400,12 +1421,20 @@ class Stage2EstimatorGraphBootstrap:
             return
         self._validate_runtime(backend)
         self.backend = backend
-        self._prompt_specs = _parse_prompt_wav_specs(self._extra())
+        self._prompt_specs = _parse_prompt_wav_specs(
+            self._extra(),
+            model_default_prompt=str(self.model._default_prompt_wav),
+        )
         census = self._build_prompt_census(backend)
         prompt_contract = {
             "profile": self.profile,
-            "prompt_manifest_path": str(Path(str(self._extra()[_PROMPT_MANIFEST_KEY])).resolve(strict=True)),
-            "prompt_manifest_sha256": str(self._extra()[_PROMPT_MANIFEST_SHA_KEY]),
+            "prompt_manifest_mode": str(self._extra().get(_PROMPT_MANIFEST_MODE_KEY, "")),
+            "prompt_manifest_path": (
+                str(Path(str(self._extra()[_PROMPT_MANIFEST_KEY])).resolve(strict=True))
+                if self._extra().get(_PROMPT_MANIFEST_KEY)
+                else ""
+            ),
+            "prompt_manifest_sha256": str(self._extra().get(_PROMPT_MANIFEST_SHA_KEY, "")),
             "prompt_wav_count": len(self._prompt_census),
             "unique_prompt_lengths": sorted(self._allowed_prompt_frames),
             "expected_roles": sorted(self._expected_roles),

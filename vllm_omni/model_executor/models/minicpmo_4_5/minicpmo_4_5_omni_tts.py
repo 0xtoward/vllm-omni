@@ -13,6 +13,7 @@ Pipeline:
 
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -46,6 +47,35 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+
+
+@dataclass(frozen=True, slots=True)
+class _CodecProposal:
+    """One sampled codec token before any request-visible state commit."""
+
+    request_id: str
+    sampled: torch.Tensor
+    step_before: int
+    min_tokens: int
+    max_tokens: int
+    codes_before: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _CodecCommitState:
+    """Resolved one-token prefix that may be committed exactly once."""
+
+    request_id: str
+    step_before: int
+    step_after: int
+    steps_advanced: int
+    current_code: torch.Tensor
+    codes_after: torch.Tensor
+    codec_delta: torch.Tensor
+    reached_limit: bool
+    is_eos: bool
+    finished: bool
+    terminal: torch.Tensor
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -620,6 +650,222 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
 
+    def _propose_codec(
+        self,
+        hidden_state: torch.Tensor,
+        codes: torch.Tensor,
+        *,
+        request_id: str,
+        step: int,
+        min_tokens: int,
+        max_tokens: int,
+    ) -> _CodecProposal:
+        """Consume one random draw without mutating request-visible state.
+
+        Once sampling succeeds, this logical step must be committed exactly
+        once or the whole request must be abandoned. Retrying would consume a
+        second random draw and would no longer preserve the stock token stream.
+        """
+        if not request_id:
+            raise RuntimeError("MiniCPM-o Talker codec proposal requires a request id")
+        if step < 0:
+            raise RuntimeError("MiniCPM-o Talker codec proposal has a negative step")
+        if min_tokens < 0 or max_tokens <= 0:
+            raise RuntimeError("MiniCPM-o Talker codec proposal has invalid token limits")
+        if not isinstance(codes, torch.Tensor) or codes.ndim != 1:
+            raise RuntimeError("MiniCPM-o Talker codec history must be a 1-D tensor")
+        if codes.dtype != torch.long:
+            raise RuntimeError("MiniCPM-o Talker codec history must be int64")
+        if codes.device != hidden_state.device:
+            raise RuntimeError("MiniCPM-o Talker codec history/device mismatch")
+        sampled = self._sample_audio_code(hidden_state, codes, request_id, step)
+        return _CodecProposal(
+            request_id=request_id,
+            sampled=sampled,
+            step_before=step,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            codes_before=codes,
+        )
+
+    def _resolve_codec_proposal(
+        self,
+        proposal: _CodecProposal,
+        *,
+        empty_delta: torch.Tensor,
+    ) -> _CodecCommitState:
+        """Resolve EOS/limit and construct the accepted prefix without mutation."""
+        if proposal.sampled.numel() != 1 or proposal.sampled.dtype != torch.long:
+            raise RuntimeError("MiniCPM-o Talker proposal must contain one int64 token")
+        if proposal.sampled.device != proposal.codes_before.device:
+            raise RuntimeError("MiniCPM-o Talker proposal token/history device mismatch")
+        if (
+            empty_delta.shape != (0, 1)
+            or empty_delta.dtype != torch.long
+            or empty_delta.device != proposal.codes_before.device
+        ):
+            raise RuntimeError("MiniCPM-o Talker empty codec delta contract is invalid")
+        step_after = proposal.step_before + 1
+        reached_limit = step_after >= proposal.max_tokens
+        if proposal.step_before < proposal.min_tokens or reached_limit:
+            is_eos = False
+        else:
+            is_eos = int(proposal.sampled.item()) == self._num_audio_tokens - 1
+        finished = is_eos or reached_limit
+        if finished:
+            codes_after = proposal.codes_before
+            codec_delta = empty_delta
+        else:
+            codes_after = torch.cat(
+                [
+                    proposal.codes_before[-(_REPETITION_WINDOW - 1) :],
+                    proposal.sampled.reshape(1),
+                ]
+            )
+            codec_delta = proposal.sampled.reshape(1, 1)
+        return _CodecCommitState(
+            request_id=proposal.request_id,
+            step_before=proposal.step_before,
+            step_after=step_after,
+            steps_advanced=1,
+            current_code=proposal.sampled.reshape(1),
+            codes_after=codes_after,
+            codec_delta=codec_delta,
+            reached_limit=reached_limit,
+            is_eos=is_eos,
+            finished=finished,
+            terminal=torch.tensor(finished, dtype=torch.bool),
+        )
+
+    def _commit_codec_prefix(
+        self,
+        *,
+        info: dict[str, Any],
+        state: dict[str, Any],
+        commit: _CodecCommitState,
+        sparse_output: bool,
+        empty_delta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Commit exactly once after all possibly failing payload work succeeds."""
+        if str(info.get("request_id", commit.request_id)) != commit.request_id:
+            raise RuntimeError("MiniCPM-o Talker codec commit request mismatch")
+        if int(state.get("step", 0)) != commit.step_before or state.get("finished"):
+            raise RuntimeError("MiniCPM-o Talker codec commit is stale or duplicated")
+        if (
+            commit.step_before < 0
+            or commit.steps_advanced != 1
+            or commit.step_after != commit.step_before + 1
+        ):
+            raise RuntimeError("MiniCPM-o Talker codec commit has invalid step accounting")
+        if commit.finished != (commit.is_eos or commit.reached_limit):
+            raise RuntimeError("MiniCPM-o Talker codec commit stop flags are inconsistent")
+        if (
+            commit.current_code.shape != (1,)
+            or commit.current_code.dtype != torch.long
+            or commit.codes_after.ndim != 1
+            or commit.codes_after.dtype != torch.long
+            or commit.codec_delta.ndim != 2
+            or commit.codec_delta.shape[1:] != (1,)
+            or commit.codec_delta.dtype != torch.long
+            or commit.current_code.device != commit.codes_after.device
+            or commit.codec_delta.device != commit.codes_after.device
+            or empty_delta.shape != (0, 1)
+            or empty_delta.dtype != torch.long
+            or empty_delta.device != commit.codes_after.device
+        ):
+            raise RuntimeError("MiniCPM-o Talker codec commit has an invalid tensor contract")
+        if commit.codec_delta.shape[0] != (0 if commit.finished else 1):
+            raise RuntimeError("MiniCPM-o Talker codec commit prefix is invalid")
+        if (
+            commit.terminal.shape != ()
+            or commit.terminal.dtype != torch.bool
+            or commit.terminal.device.type != "cpu"
+            or bool(commit.terminal.item()) != commit.finished
+        ):
+            raise RuntimeError("MiniCPM-o Talker codec terminal flag is invalid")
+
+        pending_value = state.get("sparse_pending_codec_deltas")
+        if pending_value is not None and not isinstance(pending_value, list):
+            raise RuntimeError("MiniCPM-o Talker sparse pending state is not a list")
+        pending = pending_value
+        result_delta = commit.codec_delta
+        sparse_delta: torch.Tensor | None = None
+        sparse_emits_after: int | None = None
+        sparse_suppressed_after: int | None = None
+        total_emits_after: int | None = None
+        total_suppressed_after: int | None = None
+
+        if sparse_output:
+            pending_len = len(pending) if pending is not None else 0
+            delta_rows = int(commit.codec_delta.shape[0])
+            if commit.finished or pending_len + delta_rows >= self._sparse_chunk_frames:
+                pending_rows = list(pending) if pending is not None else []
+                if delta_rows:
+                    pending_rows.append(commit.codec_delta)
+                sparse_delta = (
+                    torch.cat(pending_rows, dim=0) if pending_rows else empty_delta
+                )
+                sparse_emits_after = int(state.get("sparse_emits", 0)) + 1
+                total_emits_after = self._sparse_emit_total + 1
+            else:
+                sparse_suppressed_after = int(state.get("sparse_suppressed", 0)) + 1
+                total_suppressed_after = self._sparse_suppressed_total + 1
+        elif pending:
+            pending_rows = [row for row in pending if isinstance(row, torch.Tensor)]
+            if commit.codec_delta.numel():
+                pending_rows.append(commit.codec_delta)
+            result_delta = (
+                torch.cat(pending_rows, dim=0) if pending_rows else empty_delta
+            )
+
+        state["step"] = commit.step_after
+        state["finished"] = commit.finished
+        state["codes"] = commit.codes_after
+        info["audio_state"] = state
+        info["audio_codes"] = {
+            "current": commit.current_code,
+            "accumulated": commit.codes_after,
+        }
+
+        if sparse_output:
+            if pending is None:
+                pending = []
+                state["sparse_pending_codec_deltas"] = pending
+            if sparse_delta is not None:
+                pending.clear()
+                assert sparse_emits_after is not None and total_emits_after is not None
+                state["sparse_emits"] = sparse_emits_after
+                self._sparse_emit_total = total_emits_after
+                if self._sparse_emit_total == 1 or self._sparse_emit_total % 64 == 0:
+                    logger.info(
+                        "MINICPMO45_SPARSE_CHUNK event=emit emits=%d suppressed=%d rows=%d terminal=%s",
+                        self._sparse_emit_total,
+                        self._sparse_suppressed_total,
+                        int(sparse_delta.shape[0]),
+                        commit.finished,
+                    )
+            else:
+                if commit.codec_delta.numel():
+                    pending.append(commit.codec_delta)
+                assert (
+                    sparse_suppressed_after is not None
+                    and total_suppressed_after is not None
+                )
+                state["sparse_suppressed"] = sparse_suppressed_after
+                self._sparse_suppressed_total = total_suppressed_after
+                if (
+                    self._sparse_suppressed_total == 1
+                    or self._sparse_suppressed_total % 1024 == 0
+                ):
+                    logger.info(
+                        "MINICPMO45_SPARSE_CHUNK event=suppress emits=%d suppressed=%d",
+                        self._sparse_emit_total,
+                        self._sparse_suppressed_total,
+                    )
+        elif pending:
+            pending.clear()
+        return result_delta, commit.terminal, sparse_delta
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -747,83 +993,42 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
-            sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
-            state["step"] = int(state.get("step", 0)) + 1
-            reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
-            # EOS is masked to -inf before min_tokens, and the hard-limit
-            # sample is discarded regardless. Keep the sampled token on the
-            # NPU in both cases instead of forcing a device-to-host fence.
-            if step < int(state.get("min_tokens", self._codec_min_tokens)) or reached_limit:
-                is_eos = False
-            else:
-                is_eos = int(sampled.item()) == self._num_audio_tokens - 1
-            finished = is_eos or reached_limit
-            state["finished"] = finished
-            # MiniCPMTTS.generate_chunk consumes the boundary sample but
-            # returns only codes that were fed into the retained KV state.
-            if not is_eos and not reached_limit:
-                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
-                delta = sampled.reshape(1, 1)
-            else:
-                delta = empty_delta
-            state["codes"] = codes
-            info["audio_state"] = state
-            info["audio_codes"] = {
-                "current": sampled.reshape(1),
-                "accumulated": codes,
-            }
+            proposal = self._propose_codec(
+                hidden[end - 1 : end],
+                codes,
+                request_id=request_id,
+                step=step,
+                min_tokens=int(state.get("min_tokens", self._codec_min_tokens)),
+                max_tokens=int(state.get("max_tokens", 2048)),
+            )
+            commit = self._resolve_codec_proposal(
+                proposal,
+                empty_delta=empty_delta,
+            )
+            delta, terminal, sparse_delta = self._commit_codec_prefix(
+                info=info,
+                state=state,
+                commit=commit,
+                sparse_output=sparse_output,
+                empty_delta=empty_delta,
+            )
             codec_deltas.append(delta)
-            terminal = torch.tensor(finished, dtype=torch.bool)
             terminal_flags.append(terminal)
-            if sparse_output:
-                pending = state.setdefault("sparse_pending_codec_deltas", [])
-                if delta.numel():
-                    pending.append(delta)
-                if finished or len(pending) >= self._sparse_chunk_frames:
-                    if pending:
-                        sparse_delta = torch.cat(pending, dim=0)
-                        pending.clear()
-                    else:
-                        sparse_delta = empty_delta
-                    sparse_req_ids.append(request_id)
-                    sparse_codec_deltas.append(sparse_delta)
-                    sparse_terminal_flags.append(terminal)
-                    state["sparse_emits"] = int(state.get("sparse_emits", 0)) + 1
-                    self._sparse_emit_total += 1
-                    if self._sparse_emit_total == 1 or self._sparse_emit_total % 64 == 0:
-                        logger.info(
-                            "MINICPMO45_SPARSE_CHUNK event=emit emits=%d suppressed=%d rows=%d terminal=%s",
-                            self._sparse_emit_total,
-                            self._sparse_suppressed_total,
-                            int(sparse_delta.shape[0]),
-                            finished,
-                        )
-                else:
-                    state["sparse_suppressed"] = int(state.get("sparse_suppressed", 0)) + 1
-                    self._sparse_suppressed_total += 1
-                    if self._sparse_suppressed_total == 1 or self._sparse_suppressed_total % 1024 == 0:
-                        logger.info(
-                            "MINICPMO45_SPARSE_CHUNK event=suppress emits=%d suppressed=%d",
-                            self._sparse_emit_total,
-                            self._sparse_suppressed_total,
-                        )
-            else:
-                pending = state.get("sparse_pending_codec_deltas")
-                if isinstance(pending, list) and pending:
-                    pending_rows = [row for row in pending if isinstance(row, torch.Tensor)]
-                    if delta.numel():
-                        pending_rows.append(delta)
-                    codec_deltas[-1] = (
-                        torch.cat(pending_rows, dim=0) if pending_rows else empty_delta
-                    )
-                    pending.clear()
+            if sparse_output and sparse_delta is not None:
+                sparse_req_ids.append(request_id)
+                sparse_codec_deltas.append(sparse_delta)
+                sparse_terminal_flags.append(terminal)
             # The binary stop rows are immutable constants. Reuse them instead
             # of allocating and copying a two-element NPU tensor every step.
-            row_attr = "_finished_stop_row" if finished else "_continue_stop_row"
+            row_attr = (
+                "_finished_stop_row" if commit.finished else "_continue_stop_row"
+            )
             row = getattr(self, row_attr)
             if row is None or row.device != hidden.device or row.dtype != hidden.dtype:
                 row = hidden.new_tensor(
-                    [float("-inf"), 0.0] if finished else [0.0, float("-inf")]
+                    [float("-inf"), 0.0]
+                    if commit.finished
+                    else [0.0, float("-inf")]
                 )
                 setattr(self, row_attr, row)
             stop_rows.append(row)

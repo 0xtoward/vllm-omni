@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import json
 import os
 import tempfile
@@ -98,7 +99,18 @@ def register_omni_models_to_vllm():
     supported_archs = ModelRegistry.get_supported_archs()
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+            module_name = f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}"
+            if current_omni_platform.is_npu() and arch.startswith("MiniCPMO45"):
+                # vLLM inspects string-registered model classes in a short-lived
+                # subprocess. Some Ascend images abort while torch_npu is being
+                # torn down in that subprocess, after the model information has
+                # already been computed. Register MiniCPM-o 4.5 classes directly
+                # on NPU so vLLM derives the same interfaces in the long-lived
+                # service process and does not depend on subprocess teardown.
+                module = importlib.import_module(module_name)
+                ModelRegistry.register_model(arch, getattr(module, cls_name))
+            else:
+                ModelRegistry.register_model(arch, f"{module_name}:{cls_name}")
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401
