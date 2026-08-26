@@ -6,14 +6,73 @@ import importlib.metadata
 import sys
 
 
-def _maybe_reexec_minicpmo45_npu_under_numactl() -> None:
-    """Apply MiniCPM-o NPU process defaults before stage processes spawn.
+def _parse_linux_cpu_list(value: str) -> set[int]:
+    cpus: set[int] = set()
+    for item in value.strip().split(","):
+        if not item:
+            continue
+        if "-" in item:
+            first, last = (int(part) for part in item.split("-", 1))
+            cpus.update(range(first, last + 1))
+        else:
+            cpus.add(int(item))
+    return cpus
 
-    The official launcher does not set CPU affinity.  Binding only after the
-    engine children exist leaves their first-touch pages and worker threads
-    scattered across NUMA nodes, so this narrowly scoped re-exec happens at
-    the CLI boundary.  Missing/forbidden ``numactl`` is a safe no-op, and an
-    explicit environment setting can opt out or select another measured node.
+
+def _select_local_numa_cpuset(
+    allowed: set[int],
+    node_cpus: dict[int, set[int]],
+    preferred_node: int | None = None,
+) -> tuple[int, set[int]] | None:
+    """Choose one NUMA-local subset without escaping the inherited cpuset."""
+    candidates = {
+        node: allowed & cpus for node, cpus in node_cpus.items() if allowed & cpus
+    }
+    if not candidates:
+        return None
+    if preferred_node is not None and preferred_node in candidates:
+        return preferred_node, candidates[preferred_node]
+    node = min(candidates, key=lambda item: (-len(candidates[item]), item))
+    return node, candidates[node]
+
+
+def _limit_minicpmo45_npu_to_local_cpuset() -> None:
+    """Narrow the parent cpuset before vLLM-Ascend performs native binding.
+
+    vLLM-Ascend remains the sole owner of worker/ACL/release thread affinity,
+    IRQ placement and page migration. This only prevents its A3 global-slice
+    mode from constructing one worker pool across several NUMA nodes. The
+    inherited cgroup/cpuset is always respected.
+    """
+    import glob
+    import os
+    from pathlib import Path
+
+    if os.environ.get("MINICPMO45_NO_NUMA_AFFINITY") == "1":
+        return
+    allowed = set(os.sched_getaffinity(0))
+    node_cpus: dict[int, set[int]] = {}
+    for path_value in glob.glob("/sys/devices/system/node/node*/cpulist"):
+        path = Path(path_value)
+        suffix = path.parent.name.removeprefix("node")
+        if suffix.isdigit():
+            node_cpus[int(suffix)] = _parse_linux_cpu_list(path.read_text())
+    preferred = os.environ.get("MINICPMO45_NUMA_NODE")
+    selected = _select_local_numa_cpuset(
+        allowed,
+        node_cpus,
+        int(preferred) if preferred is not None else None,
+    )
+    if selected is None:
+        return
+    node, cpus = selected
+    if cpus != allowed:
+        os.sched_setaffinity(0, cpus)
+    os.environ["_MINICPMO45_NUMA_AFFINITY"] = f"node{node}:{len(cpus)}"
+
+
+def _maybe_prepare_minicpmo45_npu_runtime() -> None:
+    """Apply MiniCPM-o NPU process defaults before stage processes spawn.
 
     Model-local performance switches live here instead of in the registered
     model modules.  vLLM hashes those modules for its ModelInfo cache; changing
@@ -45,27 +104,12 @@ def _maybe_reexec_minicpmo45_npu_under_numactl() -> None:
         "1",
     )
 
-    if os.environ.get("_MINICPMO45_NUMACTL_DONE") == "1":
-        return
-    if os.environ.get("MINICPMO45_NO_NUMACTL") == "1":
-        return
-
-    env = dict(os.environ)
-    env["_MINICPMO45_NUMACTL_DONE"] = "1"
-    node = env.get("MINICPMO45_NUMACTL_NODE", "0")
-    cmd = ["numactl", f"--cpunodebind={node}", sys.executable, *sys.argv]
-    try:
-        os.execvpe("numactl", cmd, env)
-    except OSError:
-        # The evaluator image normally provides numactl.  Keep serving valid
-        # on other images instead of turning an optional affinity optimization
-        # into a startup dependency.
-        return
+    _limit_minicpmo45_npu_to_local_cpuset()
 
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    _maybe_reexec_minicpmo45_npu_under_numactl()
+    _maybe_prepare_minicpmo45_npu_runtime()
     # Check if --omni flag is present
     if "--omni" not in sys.argv:
         from vllm.entrypoints.cli.main import main as vllm_main

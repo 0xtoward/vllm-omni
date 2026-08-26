@@ -7,16 +7,34 @@ import sys
 import pytest
 
 from vllm_omni.entrypoints.cli.main import (
-    _maybe_reexec_minicpmo45_npu_under_numactl,
+    _maybe_prepare_minicpmo45_npu_runtime,
+    _select_local_numa_cpuset,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_minicpmo45_npu_serve_reexecs_under_configured_numa_node(monkeypatch):
-    calls = []
-    monkeypatch.delenv("_MINICPMO45_NUMACTL_DONE", raising=False)
-    monkeypatch.delenv("MINICPMO45_NO_NUMACTL", raising=False)
+def test_select_local_numa_cpuset_respects_allowed_and_largest_node():
+    selected = _select_local_numa_cpuset(
+        {3, 4, 5, 20, 21},
+        {0: {0, 1, 2, 3, 4, 5}, 1: {20, 21, 22}},
+    )
+    assert selected == (0, {3, 4, 5})
+
+
+def test_select_local_numa_cpuset_honors_available_preference():
+    selected = _select_local_numa_cpuset(
+        {0, 1, 20, 21},
+        {0: {0, 1}, 1: {20, 21}},
+        preferred_node=1,
+    )
+    assert selected == (1, {20, 21})
+
+
+def test_minicpmo45_npu_serve_limits_parent_before_native_binding(monkeypatch):
+    calls: list[tuple[int, set[int]]] = []
+    monkeypatch.delenv("MINICPMO45_NO_NUMA_AFFINITY", raising=False)
+    monkeypatch.delenv("MINICPMO45_NUMA_NODE", raising=False)
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES",
         raising=False,
@@ -25,63 +43,38 @@ def test_minicpmo45_npu_serve_reexecs_under_configured_numa_node(monkeypatch):
         "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",
         raising=False,
     )
-    monkeypatch.setenv("MINICPMO45_NUMACTL_NODE", "3")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setattr(
         sys,
         "argv",
         ["vllm", "serve", "/models/MiniCPM-o-4_5", "--omni"],
     )
-    # Containers may expose physical nodes such as davinci6/7 instead of
-    # davinci0.  The manager device is the stable Ascend runtime signal.
     monkeypatch.setattr(
         os.path,
         "exists",
         lambda path: path == "/dev/davinci_manager",
     )
-
-    def record_exec(file, argv, env):
-        calls.append((file, argv, env))
-        raise OSError("test sentinel")
-
-    monkeypatch.setattr(os, "execvpe", record_exec)
-    _maybe_reexec_minicpmo45_npu_under_numactl()
-
-    assert len(calls) == 1
-    file, argv, env = calls[0]
-    assert file == "numactl"
-    assert argv[:3] == ["numactl", "--cpunodebind=3", sys.executable]
-    assert argv[3:] == sys.argv
-    assert env["_MINICPMO45_NUMACTL_DONE"] == "1"
-    assert env["VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES"] == "25"
-    assert env["VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM"] == "1"
-
-
-def test_minicpmo45_numactl_opt_out_preserves_official_command(monkeypatch):
-    monkeypatch.setenv("MINICPMO45_NO_NUMACTL", "1")
-    monkeypatch.delenv("_MINICPMO45_NUMACTL_DONE", raising=False)
-    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES",
-        "0",
-    )
-    monkeypatch.delenv(
-        "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["vllm", "serve", "/models/MiniCPM-o-4_5", "--omni"],
-    )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(8)))
     monkeypatch.setattr(
         os,
-        "execvpe",
-        lambda *_args, **_kwargs: pytest.fail("unexpected re-exec"),
+        "sched_setaffinity",
+        lambda pid, cpus: calls.append((pid, set(cpus))),
+    )
+    monkeypatch.setattr(
+        "glob.glob",
+        lambda _pattern: [
+            "/sys/devices/system/node/node0/cpulist",
+            "/sys/devices/system/node/node1/cpulist",
+        ],
+    )
+    monkeypatch.setattr(
+        "pathlib.Path.read_text",
+        lambda path: "0-3" if "node0" in str(path) else "4-7",
     )
 
-    _maybe_reexec_minicpmo45_npu_under_numactl()
+    _maybe_prepare_minicpmo45_npu_runtime()
 
-    # NUMA opt-out does not disable the model defaults, and explicit model
-    # opt-outs remain authoritative.
-    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES"] == "0"
+    assert calls == [(0, {0, 1, 2, 3})]
+    assert os.environ["_MINICPMO45_NUMA_AFFINITY"] == "node0:4"
+    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES"] == "25"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM"] == "1"
