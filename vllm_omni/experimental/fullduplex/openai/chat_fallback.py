@@ -110,6 +110,10 @@ class ChatFallbackProjectorMixin:
         request = ChatCompletionRequest(**kwargs)
         object.__setattr__(request, "modalities", response_config.modalities)
         object.__setattr__(request, "request_id", request_id)
+        # Keep the ordinary chat endpoint's explicit-TTS fast path out of the
+        # realtime state machine.  Duplex must preserve listen/speak history,
+        # interruption, and segment-boundary semantics.
+        object.__setattr__(request, "_minicpmo45_native_duplex", True)
         object.__setattr__(
             request,
             "chat_template_kwargs",

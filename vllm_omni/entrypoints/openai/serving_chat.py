@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -202,6 +203,149 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if model_arch == "MiniCPMO45OmniForConditionalGeneration":
                 return True
         return False
+
+    @staticmethod
+    def _minicpmo45_message_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") if part.get("type") == "text" else None
+            else:
+                text = getattr(part, "text", None) if getattr(part, "type", None) == "text" else None
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _minicpmo45_plain_text_content(content: Any) -> str | None:
+        """Return text only when every content part is textual."""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list) or not content:
+            return None
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                part_type = part.get("type")
+                text = part.get("text")
+            else:
+                part_type = getattr(part, "type", None)
+                text = getattr(part, "text", None)
+            if part_type != "text" or not isinstance(text, str):
+                return None
+            parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _minicpmo45_exact_tts_target(messages: list[Any]) -> str | None:
+        """Return the declared plain-text speech target, if one is present."""
+        rows = OmniOpenAIServingChat._messages_to_dicts(messages)
+        system_text = "\n".join(
+            OmniOpenAIServingChat._minicpmo45_message_text(row.get("content"))
+            for row in rows
+            if row.get("role") == "system"
+        )
+        if "The user message is the exact text you must speak." not in system_text:
+            return None
+        user_rows = [row for row in rows if row.get("role") == "user"]
+        if len(user_rows) != 1 or any(row.get("role") not in {"system", "user"} for row in rows):
+            return None
+        target_content = OmniOpenAIServingChat._minicpmo45_plain_text_content(user_rows[0].get("content"))
+        if target_content is None:
+            return None
+        target = target_content.strip()
+        return target or None
+
+    def _maybe_apply_minicpmo45_teacher_forced_tts_prompt(
+        self,
+        request: ChatLikeRequest | ResponsesRequest,
+        messages: list[Any],
+        tokenizer: TokenizerLike | None,
+        engine_prompt: dict[str, Any],
+    ) -> bool:
+        """Append an explicitly declared speech target to the thinker prefill.
+
+        This is enabled by default only for the exact-TTS request contract and
+        remains explicitly opt-out. Ordinary assistant chat still uses
+        autoregressive text generation.
+        """
+        if os.environ.get("VLLM_OMNI_MINICPMO45_STAGE0_TEACHER_FORCED_TTS", "1") == "0":
+            return False
+        if not self._has_minicpmo45_stage() or tokenizer is None:
+            return False
+        if getattr(request, "_minicpmo45_native_duplex", False):
+            return False
+        template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        if not bool(template_kwargs.get("use_tts_template")):
+            return False
+        modalities = getattr(request, "modalities", None) or []
+        if (
+            "audio" not in modalities
+            or getattr(request, "tools", None)
+            or getattr(request, "tool_choice", None) not in {None, "none"}
+            or getattr(request, "logprobs", False)
+            or getattr(request, "prompt_logprobs", None) is not None
+            or getattr(request, "return_tokens_as_token_ids", False)
+            or getattr(request, "n", None) not in {None, 1}
+        ):
+            return False
+        target = self._minicpmo45_exact_tts_target(messages)
+        if target is None:
+            return False
+
+        prompt_ids = engine_prompt.get("prompt_token_ids")
+        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+        encode = getattr(tokenizer, "encode", None)
+        if not isinstance(prompt_ids, list) or not prompt_ids or not callable(convert) or not callable(encode):
+            return False
+        tts_bos_id = int(convert("<|tts_bos|>"))
+        tts_eos_id = int(convert("<|tts_eos|>"))
+        if prompt_ids[-1] != tts_bos_id or min(tts_bos_id, tts_eos_id) < 0:
+            logger.warning(
+                "MiniCPM-o teacher-forced TTS rejected: prompt/boundary mismatch "
+                "last=%s bos=%s eos=%s",
+                prompt_ids[-1],
+                tts_bos_id,
+                tts_eos_id,
+            )
+            return False
+        target_ids = list(encode(target, add_special_tokens=False))
+        if not target_ids or tts_bos_id in target_ids or tts_eos_id in target_ids:
+            return False
+
+        stage_configs = getattr(self.engine_client, "stage_configs", []) or []
+        stage0_args = self._stage_get(stage_configs[0], "engine_args") if stage_configs else None
+        stage0_limit = self._stage_get(stage0_args, "max_model_len")
+        if isinstance(stage0_limit, int) and stage0_limit > 0:
+            if len(prompt_ids) + len(target_ids) + 1 >= stage0_limit:
+                return False
+        if len(stage_configs) > 1:
+            stage1_args = self._stage_get(stage_configs[1], "engine_args")
+            stage1_limit = self._stage_get(stage1_args, "max_model_len")
+            if isinstance(stage1_limit, int) and stage1_limit > 0:
+                if len(target_ids) + 1 >= stage1_limit:
+                    return False
+
+        target_start = len(prompt_ids)
+        target_end = target_start + len(target_ids)
+        engine_prompt["prompt_token_ids"] = [*prompt_ids, *target_ids, tts_eos_id]
+        info = self._ensure_prompt_additional_information(engine_prompt)
+        info["minicpmo45_teacher_forced_tts"] = {
+            "target_start": target_start,
+            "target_end": target_end,
+            "target_token_ids": target_ids,
+            "target_text": target,
+        }
+        logger.info(
+            "MiniCPM-o Stage0 teacher-forced TTS engaged: prompt_tokens=%d target_tokens=%d",
+            target_start,
+            len(target_ids),
+        )
+        return True
 
     def _fix_minicpmo45_audio_stream_output_kinds(
         self,
@@ -650,6 +794,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
+        teacher_forced_text_target: str | None = None
         try:
             for i, engine_prompt in enumerate(engine_prompts):
                 if hasattr(request, "sampling_params_list"):
@@ -657,6 +802,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
+
+                prompt_info = engine_prompt.get("additional_information", {})
+                if isinstance(prompt_info, dict) and "minicpmo45_teacher_forced_tts" in prompt_info:
+                    teacher_info = prompt_info["minicpmo45_teacher_forced_tts"]
+                    if isinstance(teacher_info, dict) and isinstance(teacher_info.get("target_text"), str):
+                        teacher_forced_text_target = teacher_info["target_text"]
+                    comprehension_idx = self._get_comprehension_stage_index()
+                    if 0 <= comprehension_idx < len(sampling_params_list):
+                        thinker_params = sampling_params_list[comprehension_idx]
+                        thinker_params.max_tokens = 1
+                        thinker_params.min_tokens = 1
 
                 # If this is a streaming (output) request, coerce cumulative outputs
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
@@ -712,6 +868,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
                 reasoning_parser,
                 raw_request=raw_request,
+                teacher_forced_text_target=teacher_forced_text_target,
             )
 
         try:
@@ -724,6 +881,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                teacher_forced_text_target=teacher_forced_text_target,
             )
         except ValueError as e:
             return self.create_error_response(e)
@@ -851,6 +1009,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if instructions is not None and isinstance(instructions, str) and instructions.strip():
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
             prompt_additional_information["instruction"] = instructions.strip()
+
+        self._maybe_apply_minicpmo45_teacher_forced_tts_prompt(
+            request,
+            messages,
+            tokenizer,
+            engine_prompt,
+        )
 
         return conversation, [engine_prompt]
 
@@ -1300,6 +1465,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
         raw_request: Request | None = None,
+        teacher_forced_text_target: str | None = None,
     ):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -1313,6 +1479,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
+        teacher_forced_text_sent = [False] * num_choices
         finish_reason_sent = [False] * num_choices
         modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
         modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
@@ -1516,6 +1683,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             cur_recipient = harmony_parser.current_recipient
                         else:
                             delta_text = output.text or ""
+
+                        # The exact-TTS fast path computes the declared target's
+                        # hidden rows in the prompt and only runs one lifecycle
+                        # token through Stage0. Preserve the public text response
+                        # by returning that target once instead of the dummy token.
+                        if (
+                            teacher_forced_text_target is not None
+                            and not teacher_forced_text_sent[i]
+                            and (output.token_ids or output.finish_reason is not None)
+                        ):
+                            delta_text = teacher_forced_text_target
+                            teacher_forced_text_sent[i] = True
+                        elif teacher_forced_text_target is not None and teacher_forced_text_sent[i]:
+                            delta_text = ""
 
                         if not delta_text and not output.token_ids and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
@@ -2215,6 +2396,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        teacher_forced_text_target: str | None = None,
     ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -2270,6 +2452,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         role,
                         reasoning_parser,
                     )
+                    if teacher_forced_text_target is not None:
+                        for choice in choices_data:
+                            choice.message.content = teacher_forced_text_target
                     final_res = omni_outputs.request_output
                 else:
                     # Diffusion pipeline text output (e.g. single-stage
