@@ -61,3 +61,45 @@ __all__ = [
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.
 ]
+
+
+def _minicpmo45_allow_view_optimize_option() -> None:
+    """Accept torch_npu's own W8 graph compatibility option.
+
+    The image's ``npu_fx_compiler`` sets ``enable_view_optimize=False`` when a
+    weight-quant matmul enters an ACL graph, but the matching config class does
+    not declare that option. Resolve the actual base class from the config MRO
+    and permit only this vendor-owned key.
+    """
+    bases = []
+    try:
+        from torch_npu.dynamo.npugraph_ex.configs import experimental_config
+
+        for name in ("_ExperimentalConfig", "_AclGraphExperimentalConfig"):
+            config_class = getattr(experimental_config, name, None)
+            if config_class is None:
+                continue
+            for base in config_class.__mro__[1:]:
+                if base is not object and "__setattr__" in base.__dict__ and base not in bases:
+                    bases.append(base)
+    except Exception:
+        return
+
+    for base in bases:
+        if getattr(base, "_minicpmo45_view_optimize_patched", False):
+            continue
+        original_setattr = base.__setattr__
+
+        def tolerant_setattr(self, key, value, _original=original_setattr):
+            if key == "enable_view_optimize":
+                fixed = self.__dict__.get("_fixed_attrs")
+                if fixed is not None and key not in fixed:
+                    object.__setattr__(self, key, value)
+                    return
+            return _original(self, key, value)
+
+        base.__setattr__ = tolerant_setattr
+        base._minicpmo45_view_optimize_patched = True
+
+
+_minicpmo45_allow_view_optimize_option()

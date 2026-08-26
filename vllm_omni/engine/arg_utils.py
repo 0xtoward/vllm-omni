@@ -16,6 +16,20 @@ from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
 
+
+def _minicpmo45_register_runtime_w8a16() -> None:
+    """Register the load-time W8A16 scheme in every worker process."""
+    try:
+        from vllm_omni.model_executor.layers.minicpmo45_runtime_w8a16 import (
+            register,
+        )
+    except Exception:
+        return
+    register()
+
+
+_minicpmo45_register_runtime_w8a16()
+
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {

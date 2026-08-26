@@ -92,6 +92,29 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
+        # The challenge supplies the original BF16 MiniCPM-o 4.5 checkpoint.
+        # On NPU, replace only its config view with a tiny symlink overlay so
+        # Stage0 can use the validated load-time W8A16 scheme without shipping
+        # or modifying model weights. Preserve the public served model name.
+        if os.path.exists("/dev/davinci_manager"):
+            from vllm_omni.model_executor.layers.minicpmo45_runtime_w8a16 import (
+                prepare_model_overlay,
+            )
+
+            original_model = args.model
+            overlay_model = prepare_model_overlay(original_model)
+            if overlay_model != original_model:
+                if getattr(args, "served_model_name", None) is None:
+                    args.served_model_name = [original_model]
+                args.model = overlay_model
+                if hasattr(args, "model_tag"):
+                    args.model_tag = overlay_model
+                logger.info(
+                    "MiniCPM-o 4.5 Stage0 runtime W8A16 overlay: %s -> %s",
+                    original_model,
+                    overlay_model,
+                )
+
         if getattr(args, "no_guardrails", False):
             existing = getattr(args, "model_config", None)
             model_config = dict(existing) if isinstance(existing, dict) else {}
