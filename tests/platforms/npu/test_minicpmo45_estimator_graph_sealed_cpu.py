@@ -948,6 +948,12 @@ def test_instance_hook_does_not_modify_backend_class():
         def decode_batch(self):
             return "decode"
 
+        def _stack_flow_cache(self, states):
+            return states
+
+        def _split_flow_cache(self, cache, batch_size):
+            return cache, batch_size
+
     model = SimpleNamespace()
     bootstrap = graph_impl.Stage2EstimatorGraphBootstrap(
         model,
