@@ -78,6 +78,31 @@ class _CodecCommitState:
     terminal: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredCodecEntry:
+    """One model proposal waiting for the runner's sampled stop token."""
+
+    output_index: int
+    info: dict[str, Any]
+    state: dict[str, Any]
+    proposal: _CodecProposal
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredCodecBatch:
+    """Single in-flight K=1 codec commit owned by ``sample_tokens``.
+
+    The model still samples exactly one codec token during forward.  Only the
+    CPU-visible state mutation is delayed until the runner has copied its
+    binary continue/stop samples to CPU for normal scheduler bookkeeping.
+    """
+
+    multimodal_outputs: dict[str, Any]
+    entries: tuple[_DeferredCodecEntry, ...]
+    empty_delta: torch.Tensor
+    sparse_output: bool
+
+
 def _max_audio_tokens(condition_tokens: int) -> int:
     """Bound codec generation with a conservative text-length estimate.
 
@@ -128,6 +153,40 @@ def _apply_repetition_penalty(
     return scored
 
 
+def _restore_top_p_mask(
+    remove: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    *,
+    use_npu_scatter_nd_update: bool,
+    scatter_nd_update_op: Any | None = None,
+) -> torch.Tensor:
+    """Restore a sorted Top-P mask without an in-place graph side effect.
+
+    MiniCPM-o's C=1 sampler writes every vocabulary position exactly once, so
+    a functional ScatterNdUpdate is equivalent to ``Tensor.scatter``.  Keep a
+    strict shape/device gate: flattening indices is only valid for one row.
+    """
+    if (
+        use_npu_scatter_nd_update
+        and remove.device.type == "npu"
+        and remove.ndim == 2
+        and remove.shape[0] == 1
+        and sorted_indices.shape == remove.shape
+    ):
+        op = scatter_nd_update_op
+        if op is None:
+            npu_ops = getattr(torch.ops, "npu", None)
+            op = getattr(npu_ops, "npu_scatter_nd_update", None)
+        if op is not None:
+            flat_remove = remove.reshape(-1)
+            return op(
+                torch.empty_like(flat_remove),
+                sorted_indices.reshape(-1, 1),
+                flat_remove,
+            ).reshape_as(remove)
+    return remove.scatter(-1, sorted_indices, remove)
+
+
 def _apply_top_k_top_p(
     logits: torch.Tensor,
     *,
@@ -135,6 +194,7 @@ def _apply_top_k_top_p(
     top_p: float | None,
     min_tokens_to_keep: int = 3,
     inplace: bool = False,
+    use_npu_scatter_nd_update: bool = False,
 ) -> torch.Tensor:
     """Apply the same candidate floors as the upstream Transformers warpers."""
     filtered = logits if inplace else logits.clone()
@@ -146,7 +206,11 @@ def _apply_top_k_top_p(
         cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
         remove = cumulative_probs <= (1.0 - float(top_p))
         remove[..., -min_tokens_to_keep:] = False
-        remove = remove.scatter(-1, sorted_indices, remove)
+        remove = _restore_top_p_mask(
+            remove,
+            sorted_indices,
+            use_npu_scatter_nd_update=use_npu_scatter_nd_update,
+        )
         filtered.masked_fill_(remove, float("-inf"))
     if top_k is not None and top_k > 0:
         keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
@@ -195,6 +259,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """Runner-owned MiniCPM-o 4.5 Talker that emits codec tokens only."""
 
     requires_request_sample_eligibility = True
+    supports_codec_embed_graph = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -210,6 +275,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
+        self._deferred_codec_batch: _DeferredCodecBatch | None = None
+        self._deferred_codec_commit_total = 0
+        self._deferred_codec_reject_reasons_logged: set[str] = set()
         npu_default = "1" if current_omni_platform.is_npu() else "0"
         self._codec_sampler_graph_enabled = os.environ.get(
             "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_SAMPLER_NPUGRAPH", npu_default
@@ -220,8 +288,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._codec_sampler_graph_failed = False
         self._codec_sampler_graph_hits = 0
         self._codec_sampler_graph_captures = 0
+        self._codec_sampler_scatternd_enabled = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_SAMPLER_SCATTERND",
+            npu_default,
+        ).lower() in ("1", "true", "yes", "on")
+        self._codec_greedy_enabled = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_GREEDY",
+            "0",
+        ).lower() in ("1", "true", "yes", "on")
+        self._codec_embed_graph_enabled = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_EMBED_GRAPH",
+            "1",
+        ).lower() in ("1", "true", "yes", "on")
         if self._codec_sampler_graph_enabled:
             logger.info("MINICPMO45_CODEC_SAMPLER_NPUGRAPH event=enabled")
+        if self._codec_sampler_scatternd_enabled:
+            logger.info("MINICPMO45_CODEC_SAMPLER_SCATTERND event=enabled")
+        if self._codec_greedy_enabled:
+            logger.info("MINICPMO45_CODEC_GREEDY event=enabled")
+        if self._codec_embed_graph_enabled:
+            logger.info("MINICPMO45_STAGE1_CODEC_EMBED_GRAPH event=enabled")
         raw_sparse_chunk = os.environ.get(
             "VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES",
             "0",
@@ -299,10 +385,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.emb_code = nn.ModuleList(
             [nn.Embedding(int(cfg.num_audio_tokens), int(cfg.hidden_size)) for _ in range(int(cfg.num_vq))]
         )
+        self.register_buffer(
+            "_codec_embed_graph_active",
+            torch.zeros(
+                1, dtype=torch.bool, device=self.emb_code[0].weight.device
+            ),
+            persistent=False,
+        )
+        self._codec_embed_graph_active_host = False
         self.head_code = nn.ModuleList(
             [nn.Linear(int(cfg.hidden_size), int(cfg.num_audio_tokens), bias=False) for _ in range(int(cfg.num_vq))]
         )
         self.make_empty_intermediate_tensors = self.tts_model.make_empty_intermediate_tensors
+
+    def set_codec_embed_graph_active(self, active: bool) -> None:
+        """Select graph-local codec lookup without changing its signature."""
+
+        active = bool(active)
+        if not self._codec_embed_graph_enabled or (
+            active == self._codec_embed_graph_active_host
+        ):
+            return
+        self._codec_embed_graph_active.fill_(active)
+        self._codec_embed_graph_active_host = active
 
     def _boundary_embeddings(self) -> torch.Tensor:
         """Embed the ``<text_eos><audio_bos>`` tail every condition ends with."""
@@ -465,6 +570,39 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         embeds = self.emb_code[0](code)
         return input_ids, embeds, {}
 
+    def can_preprocess_c1_decode(
+        self,
+        info_dict: dict[str, Any],
+        out: torch.Tensor,
+    ) -> bool:
+        """Whether one established codec row can use the sealed runner lane."""
+
+        state = info_dict.get("audio_state")
+        current = (info_dict.get("audio_codes", {}) or {}).get("current")
+        return bool(
+            isinstance(state, dict)
+            and not state.get("finished")
+            and isinstance(current, torch.Tensor)
+            and current.shape == (1,)
+            and current.dtype == torch.long
+            and current.device == out.device
+            and out.shape == (1, self.emb_code[0].weight.shape[1])
+            and out.dtype == self.emb_code[0].weight.dtype
+        )
+
+    def preprocess_c1_decode_into(
+        self,
+        info_dict: dict[str, Any],
+        out: torch.Tensor,
+    ) -> bool:
+        """Write the exact stock decode embedding into the persistent buffer."""
+
+        if not self.can_preprocess_c1_decode(info_dict, out):
+            return False
+        current = info_dict["audio_codes"]["current"]
+        out.copy_(self.emb_code[0](current))
+        return True
+
     def _request_generator(self, request_id: str, device: torch.device) -> torch.Generator:
         generator = self._request_generators.get(request_id)
         if generator is None:
@@ -472,6 +610,66 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator.manual_seed(self._codec_seed)
             self._request_generators[request_id] = generator
         return generator
+
+    def can_defer_codec_commit(self, request_id: str, sampling_params: Any) -> bool:
+        """Whether runner stop sampling is exactly the model's stop decision.
+
+        Deferral is deliberately restricted to the official non-duplex binary
+        controller contract.  Client logit constraints or mismatched token
+        limits could change the runner's sampled stop token after the model has
+        constructed it, so those requests retain the established immediate
+        codec commit path.
+        """
+        def reject(reason: str) -> bool:
+            # Keep diagnostics bounded by rejection reason so a missed fast
+            # path is observable without adding per-token log traffic.
+            if reason not in self._deferred_codec_reject_reasons_logged:
+                self._deferred_codec_reject_reasons_logged.add(reason)
+                logger.info(
+                    "MINICPMO45_DEFERRED_CODEC_COMMIT event=reject reason=%s "
+                    "request_id=%s state_keys=%s min_tokens=%r max_tokens=%r "
+                    "stop_ids=%r",
+                    reason,
+                    request_id,
+                    tuple(self._request_audio_states),
+                    getattr(sampling_params, "min_tokens", None),
+                    getattr(sampling_params, "max_tokens", None),
+                    getattr(sampling_params, "all_stop_token_ids", None),
+                )
+            return False
+
+        state = self._request_audio_states.get(str(request_id))
+        if not isinstance(state, dict) or state.get("finished"):
+            return reject("missing_or_finished_state")
+        try:
+            min_tokens = int(getattr(sampling_params, "min_tokens"))
+            max_tokens = int(getattr(sampling_params, "max_tokens"))
+            stop_token_ids = {
+                int(token_id)
+                for token_id in getattr(sampling_params, "all_stop_token_ids")
+                if 0 <= int(token_id) < 2
+            }
+        except (AttributeError, TypeError, ValueError):
+            return reject("invalid_sampling_contract")
+        if min_tokens != int(state.get("min_tokens", self._codec_min_tokens)):
+            return reject("min_tokens_mismatch")
+        if max_tokens < int(state.get("max_tokens", 2048)):
+            return reject("max_tokens_too_small")
+        if stop_token_ids != {1}:
+            return reject("stop_token_ids_mismatch")
+        if any(
+            (
+                getattr(sampling_params, "allowed_token_ids", None),
+                getattr(sampling_params, "logit_bias", None),
+                getattr(sampling_params, "bad_words", None),
+                getattr(sampling_params, "structured_outputs", None),
+                getattr(sampling_params, "ignore_eos", False),
+                getattr(sampling_params, "logprobs", None),
+                getattr(sampling_params, "prompt_logprobs", None),
+            )
+        ):
+            return reject("request_constraints")
+        return True
 
     def _codec_sampler_probabilities(
         self,
@@ -497,8 +695,30 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             top_p=self._codec_top_p,
             min_tokens_to_keep=3,
             inplace=True,
+            use_npu_scatter_nd_update=getattr(
+                self,
+                "_codec_sampler_scatternd_enabled",
+                False,
+            ),
         )
         return torch.softmax(logits, dim=-1)
+
+    def _ensure_codec_sampler_penalty_tensor(
+        self, device: torch.device
+    ) -> torch.Tensor:
+        penalty_tensor = self._codec_sampler_penalty_tensor
+        if (
+            penalty_tensor is None
+            or penalty_tensor.device != device
+            or penalty_tensor.dtype != torch.float32
+        ):
+            penalty_tensor = torch.tensor(
+                self._codec_repetition_penalty,
+                device=device,
+                dtype=torch.float32,
+            )
+            self._codec_sampler_penalty_tensor = penalty_tensor
+        return penalty_tensor
 
     def _capture_codec_sampler_graph(
         self,
@@ -508,18 +728,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     ) -> _CodecSamplerCapturedGraph:
         npu = torch.npu
         static_inputs = tuple(value.detach().clone() for value in inputs)
-        if (
-            self._codec_sampler_penalty_tensor is None
-            or self._codec_sampler_penalty_tensor.device != static_inputs[0].device
-            or self._codec_sampler_penalty_tensor.dtype != torch.float32
-        ):
-            # Materialize the scalar before capture; torch.as_tensor(...,
-            # device="npu") inside capture performs a forbidden synchronous H2D.
-            self._codec_sampler_penalty_tensor = torch.tensor(
-                self._codec_repetition_penalty,
-                device=static_inputs[0].device,
-                dtype=torch.float32,
-            )
+        # Materialize the scalar before capture; torch.as_tensor(...,
+        # device="npu") inside capture performs a forbidden synchronous H2D.
+        self._ensure_codec_sampler_penalty_tensor(static_inputs[0].device)
         npu.synchronize()
         graph = npu.NPUGraph()
         # Give each alternating allow_eos graph an independent pool and never
@@ -631,6 +842,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         history: torch.Tensor,
         request_id: str,
         step: int,
+        *,
+        greedy: bool = False,
     ) -> torch.Tensor:
         request_states = getattr(self, "_request_audio_states", {})
         state = request_states.get(request_id)
@@ -639,10 +852,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if isinstance(state, dict)
             else self._codec_min_tokens
         )
+        allow_eos = step >= min_tokens
+        if greedy:
+            # Positive temperature scaling and Top-P/Top-K filtering preserve
+            # the maximum-logit token.  Keep the model-specific repetition and
+            # EOS contracts, then bypass sort/filter/softmax/RNG entirely.
+            logits = self.head_code[0](hidden_state).float()
+            penalty_tensor = self._ensure_codec_sampler_penalty_tensor(
+                logits.device
+            )
+            logits = _apply_repetition_penalty(
+                logits,
+                history,
+                penalty=self._codec_repetition_penalty,
+                window_size=_REPETITION_WINDOW,
+                inplace=True,
+                penalty_tensor=penalty_tensor,
+            )
+            if not allow_eos:
+                logits[..., self._num_audio_tokens - 1] = float("-inf")
+            return torch.argmax(logits, dim=-1).reshape(())
+
         probabilities = self._run_codec_sampler_probabilities(
-            hidden_state,
-            history,
-            allow_eos=step >= min_tokens,
+            hidden_state, history, allow_eos=allow_eos
         )
         return torch.multinomial(
             probabilities,
@@ -659,6 +891,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         step: int,
         min_tokens: int,
         max_tokens: int,
+        greedy: bool = False,
     ) -> _CodecProposal:
         """Consume one random draw without mutating request-visible state.
 
@@ -678,7 +911,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise RuntimeError("MiniCPM-o Talker codec history must be int64")
         if codes.device != hidden_state.device:
             raise RuntimeError("MiniCPM-o Talker codec history/device mismatch")
-        sampled = self._sample_audio_code(hidden_state, codes, request_id, step)
+        if greedy:
+            sampled = self._sample_audio_code(
+                hidden_state,
+                codes,
+                request_id,
+                step,
+                greedy=True,
+            )
+        else:
+            sampled = self._sample_audio_code(hidden_state, codes, request_id, step)
         return _CodecProposal(
             request_id=request_id,
             sampled=sampled,
@@ -693,6 +935,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         proposal: _CodecProposal,
         *,
         empty_delta: torch.Tensor,
+        runner_stop_token: int | None = None,
     ) -> _CodecCommitState:
         """Resolve EOS/limit and construct the accepted prefix without mutation."""
         if proposal.sampled.numel() != 1 or proposal.sampled.dtype != torch.long:
@@ -709,8 +952,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         reached_limit = step_after >= proposal.max_tokens
         if proposal.step_before < proposal.min_tokens or reached_limit:
             is_eos = False
+            expected_stop_token = int(reached_limit)
+            if runner_stop_token is not None and runner_stop_token != expected_stop_token:
+                raise RuntimeError(
+                    "MiniCPM-o Talker runner stop token disagrees with the "
+                    f"forced codec boundary: got={runner_stop_token} "
+                    f"expected={expected_stop_token}"
+                )
         else:
-            is_eos = int(proposal.sampled.item()) == self._num_audio_tokens - 1
+            if runner_stop_token is None:
+                is_eos = int(proposal.sampled.item()) == self._num_audio_tokens - 1
+            else:
+                if runner_stop_token not in (0, 1):
+                    raise RuntimeError(
+                        "MiniCPM-o Talker runner stop token must be binary, "
+                        f"got {runner_stop_token}"
+                    )
+                is_eos = runner_stop_token == 1
         finished = is_eos or reached_limit
         if finished:
             codes_after = proposal.codes_before
@@ -736,6 +994,106 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             finished=finished,
             terminal=torch.tensor(finished, dtype=torch.bool),
         )
+
+    def _cached_stop_row(self, hidden: torch.Tensor, *, finished: bool) -> torch.Tensor:
+        """Return the immutable binary stop row for the current device/dtype."""
+        row_attr = "_finished_stop_row" if finished else "_continue_stop_row"
+        row = getattr(self, row_attr)
+        if row is None or row.device != hidden.device or row.dtype != hidden.dtype:
+            row = hidden.new_tensor(
+                [float("-inf"), 0.0] if finished else [0.0, float("-inf")]
+            )
+            setattr(self, row_attr, row)
+        return row
+
+    def _proposal_stop_row(
+        self,
+        proposal: _CodecProposal,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the binary stop logits without reading the codec token on CPU."""
+        step_after = proposal.step_before + 1
+        if step_after >= proposal.max_tokens:
+            return self._cached_stop_row(hidden, finished=True)
+        if proposal.step_before < proposal.min_tokens:
+            return self._cached_stop_row(hidden, finished=False)
+        is_eos = proposal.sampled == self._num_audio_tokens - 1
+        return torch.where(
+            is_eos,
+            self._cached_stop_row(hidden, finished=True),
+            self._cached_stop_row(hidden, finished=False),
+        )
+
+    def finalize_deferred_codec_output(
+        self,
+        multimodal_outputs: dict[str, Any],
+        sampled_stop_token_ids: list[list[int]],
+    ) -> dict[str, Any]:
+        """Commit pending codec proposals after the runner's normal D2H.
+
+        ``sampled_stop_token_ids`` is the already synchronized result produced
+        by ``NPUARModelRunner._bookkeeping_sync``.  No codec tensor is read on
+        CPU here, so codec EOS and scheduler stop bookkeeping share the same
+        synchronization point while codec/RNG/history semantics remain K=1.
+        """
+        pending = self._deferred_codec_batch
+        if pending is None:
+            return multimodal_outputs
+        # Clear first: any failure abandons this request turn rather than
+        # accidentally committing the same random draw on a later runner step.
+        self._deferred_codec_batch = None
+        if multimodal_outputs is not pending.multimodal_outputs:
+            raise RuntimeError("MiniCPM-o Talker deferred output identity changed before commit")
+
+        codes_output = multimodal_outputs["codes"]["audio"]
+        meta_output = multimodal_outputs["meta"]
+        terminal_output = meta_output["finished"]
+        sparse_req_ids = meta_output.get("req_id") if pending.sparse_output else None
+
+        for entry in pending.entries:
+            if entry.output_index >= len(sampled_stop_token_ids):
+                raise RuntimeError("MiniCPM-o Talker deferred stop batch is shorter than the request batch")
+            sampled_ids = sampled_stop_token_ids[entry.output_index]
+            if len(sampled_ids) != 1:
+                raise RuntimeError(
+                    "MiniCPM-o Talker deferred commit requires one valid runner "
+                    f"sample, got {sampled_ids!r}"
+                )
+            stop_token = int(sampled_ids[0])
+            commit = self._resolve_codec_proposal(
+                entry.proposal,
+                empty_delta=pending.empty_delta,
+                runner_stop_token=stop_token,
+            )
+            if commit.finished != (stop_token == 1):
+                raise RuntimeError("MiniCPM-o Talker runner/model terminal decisions diverged")
+            delta, terminal, sparse_delta = self._commit_codec_prefix(
+                info=entry.info,
+                state=entry.state,
+                commit=commit,
+                sparse_output=pending.sparse_output,
+                empty_delta=pending.empty_delta,
+            )
+            if pending.sparse_output:
+                if sparse_delta is not None:
+                    assert isinstance(sparse_req_ids, list)
+                    sparse_req_ids.append(commit.request_id)
+                    codes_output.append(sparse_delta)
+                    terminal_output.append(terminal)
+            else:
+                codes_output[entry.output_index] = delta
+                terminal_output[entry.output_index] = terminal
+        self._deferred_codec_commit_total += len(pending.entries)
+        if (
+            self._deferred_codec_commit_total == len(pending.entries)
+            or self._deferred_codec_commit_total % 1024 == 0
+        ):
+            logger.info(
+                "MINICPMO45_DEFERRED_CODEC_COMMIT event=commit total=%d sparse=%s",
+                self._deferred_codec_commit_total,
+                pending.sparse_output,
+            )
+        return multimodal_outputs
 
     def _commit_codec_prefix(
         self,
@@ -826,6 +1184,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "current": commit.current_code,
             "accumulated": commit.codes_after,
         }
+        if commit.finished and getattr(self, "_codec_greedy_enabled", False):
+            logger.info(
+                "MINICPMO45_CODEC_GREEDY event=finish request_id=%s "
+                "steps=%d reason=%s",
+                commit.request_id,
+                commit.step_after,
+                "eos" if commit.is_eos else "max_tokens",
+            )
 
         if sparse_output:
             if pending is None:
@@ -894,6 +1260,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             and len(infos) == 1
             and not emit_duplex_metadata
         )
+        # Native duplex changes the two-way controller logits after this model
+        # hook.  It therefore cannot reuse the ordinary runner stop token as
+        # the codec EOS decision; retain the immediate commit path.
+        defer_codec_commit = bool(kwargs.get("defer_codec_commit", False)) and not emit_duplex_metadata
+        if defer_codec_commit and self._deferred_codec_batch is not None:
+            raise RuntimeError("MiniCPM-o Talker has an unconsumed deferred codec batch")
+        deferred_entries: list[_DeferredCodecEntry] = []
         sparse_req_ids: list[str] = []
         sparse_codec_deltas: list[torch.Tensor] = []
         sparse_terminal_flags: list[torch.Tensor] = []
@@ -1000,7 +1373,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 step=step,
                 min_tokens=int(state.get("min_tokens", self._codec_min_tokens)),
                 max_tokens=int(state.get("max_tokens", 2048)),
+                # Sparse output is already the strict C=1, non-duplex serving
+                # gate.  All other requests retain the stock randomized path.
+                greedy=getattr(self, "_codec_greedy_enabled", False)
+                and sparse_output,
             )
+            if defer_codec_commit:
+                deferred_entries.append(
+                    _DeferredCodecEntry(
+                        output_index=index,
+                        info=info,
+                        state=state,
+                        proposal=proposal,
+                    )
+                )
+                # Placeholders are finalized after the runner's standard
+                # sampled-token D2H.  Dense output remains request aligned;
+                # sparse output stays compact until an emit is committed.
+                codec_deltas.append(empty_delta)
+                terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                stop_rows.append(self._proposal_stop_row(proposal, hidden))
+                continue
             commit = self._resolve_codec_proposal(
                 proposal,
                 empty_delta=empty_delta,
@@ -1018,20 +1411,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 sparse_req_ids.append(request_id)
                 sparse_codec_deltas.append(sparse_delta)
                 sparse_terminal_flags.append(terminal)
-            # The binary stop rows are immutable constants. Reuse them instead
-            # of allocating and copying a two-element NPU tensor every step.
-            row_attr = (
-                "_finished_stop_row" if commit.finished else "_continue_stop_row"
-            )
-            row = getattr(self, row_attr)
-            if row is None or row.device != hidden.device or row.dtype != hidden.dtype:
-                row = hidden.new_tensor(
-                    [float("-inf"), 0.0]
-                    if commit.finished
-                    else [0.0, float("-inf")]
-                )
-                setattr(self, row_attr, row)
-            stop_rows.append(row)
+            stop_rows.append(self._cached_stop_row(hidden, finished=commit.finished))
 
         if len(stop_rows) == 1:
             # unsqueeze is a view; torch.stack would launch a copy for the
@@ -1071,12 +1451,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
+        if deferred_entries:
+            self._deferred_codec_batch = _DeferredCodecBatch(
+                multimodal_outputs=multimodal_outputs,
+                entries=tuple(deferred_entries),
+                empty_delta=empty_delta,
+                sparse_output=sparse_output,
+            )
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,
         )
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        finished_ids = {str(req_id) for req_id in finished_req_ids}
+        pending = self._deferred_codec_batch
+        if pending is not None and any(
+            entry.proposal.request_id in finished_ids for entry in pending.entries
+        ):
+            # Abort/error cleanup must not let a proposal from an earlier turn
+            # be committed by a later request's sampled controller token.
+            self._deferred_codec_batch = None
         if self._sparse_chunk_frames:
             pending_rows = sum(
                 len(state.get("sparse_pending_codec_deltas", []))
@@ -1091,7 +1486,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 len(finished_req_ids),
                 pending_rows,
             )
-        self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
+        self._deferred_cleanup_ids.update(finished_ids)
 
     def _flush_deferred_cleanup(self) -> None:
         request_audio_states = getattr(self, "_request_audio_states", {})
@@ -1135,6 +1530,30 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._flush_deferred_cleanup()
         if input_ids is None and inputs_embeds is None:
             return self._dummy_hidden_states(input_ids, positions, inputs_embeds)
+        if (
+            self._codec_embed_graph_enabled
+            and input_ids is not None
+            and inputs_embeds is not None
+            and input_ids.shape[0] == 1
+            and inputs_embeds.shape[0] == 1
+        ):
+            # Startup capture and every replay keep the same two Tensor
+            # inputs.  On a rejected/eager row the selector is false, so
+            # use index zero for the otherwise-dead lookup and return the
+            # exact stock embedding.  On the strict C=1 lane input_ids is
+            # the authoritative codec id copied into stable int32 storage.
+            safe_ids = torch.where(
+                self._codec_embed_graph_active,
+                input_ids,
+                torch.zeros_like(input_ids),
+            )
+            codec_embeds = self.emb_code[0](safe_ids)
+            inputs_embeds = torch.where(
+                self._codec_embed_graph_active.reshape(1, 1),
+                codec_embeds,
+                inputs_embeds,
+            )
+            input_ids = None
         return self.tts_model(
             input_ids=input_ids,
             positions=positions,
@@ -1172,6 +1591,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # sampler processors may update logits in place, so isolate fallback
         # requests (for example logprobs) from that cache.
         return self._fallback_stop_sampler(logits.clone(), sampling_metadata)
+
+    @staticmethod
+    def can_skip_model_sampler_output_token_history(sampling_metadata: Any) -> bool:
+        """Whether the binary controller fast sampler ignores token history."""
+
+        return bool(
+            sampling_metadata.max_num_logprobs is None
+            and not sampling_metadata.logprob_token_ids
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return self._load_native_weights(weights)

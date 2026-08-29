@@ -40,14 +40,46 @@ _PROMPT_MANIFEST_KEY = "code2wav_npu_graph_prompt_manifest"
 _PROMPT_MANIFEST_SHA_KEY = "code2wav_npu_graph_prompt_manifest_sha256"
 _PROMPT_MANIFEST_MODE_KEY = "code2wav_npu_graph_prompt_manifest_mode"
 _VALID_MODES = frozenset({"off", "runtime_only", "on"})
-_CERTIFIED_PROFILE = "cfm3_ccf25_b1_model_default_prompt_v1"
-_CERTIFIED_CFM_STEPS = 3
-_CERTIFIED_CODEC_CHUNK_FRAMES = 25
+_CFM1_CCF50_EXPERIMENT_ENV = "VLLM_OMNI_MINICPMO45_CFM1_CCF50_EXPERIMENT"
+
+
+def _certified_chunk_contract(
+    ccf50_enabled: bool,
+) -> tuple[str, int, int, int, tuple[int, ...]]:
+    codec_chunk_frames = 50 if ccf50_enabled else 25
+    left_context_frames = 3
+    estimator_width = 2 * codec_chunk_frames
+    cache_offsets = tuple(sorted({0, min(estimator_width, 100), 100}))
+    profile = "cfm1_ccf50_b1_model_default_prompt_v1" if ccf50_enabled else "cfm1_ccf25_b1_model_default_prompt_v1"
+    return (
+        profile,
+        codec_chunk_frames,
+        codec_chunk_frames + left_context_frames,
+        estimator_width,
+        cache_offsets,
+    )
+
+
+def _required_rand_noise_width(prompt_frames: int, estimator_width: int) -> int:
+    # Compact-cache state retains prompt frames plus at most 100 generated
+    # frames.  The next exact solve then slices one full estimator width.
+    return int(prompt_frames) + 100 + int(estimator_width)
+
+
+_CFM1_CCF50_EXPERIMENT = os.environ.get(
+    _CFM1_CCF50_EXPERIMENT_ENV,
+    "1",
+).strip().lower() in {"1", "true", "yes", "on"}
+(
+    _CERTIFIED_PROFILE,
+    _CERTIFIED_CODEC_CHUNK_FRAMES,
+    _CERTIFIED_CODEC_INPUT_WIDTH,
+    _CERTIFIED_ESTIMATOR_WIDTH,
+    _CERTIFIED_STEADY_CACHE_OFFSETS,
+) = _certified_chunk_contract(_CFM1_CCF50_EXPERIMENT)
+_CERTIFIED_CFM_STEPS = 1
 _CERTIFIED_LEFT_CONTEXT_FRAMES = 3
-_CERTIFIED_CODEC_INPUT_WIDTH = 28
-_CERTIFIED_ESTIMATOR_WIDTH = 50
 _CERTIFIED_PROMPT_WAV_COUNT = 1
-_CERTIFIED_STEADY_CACHE_OFFSETS = (0, 50, 100)
 _BOOTSTRAP_ATTR = "_minicpmo45_stage2_estimator_graph_bootstrap"
 _SILENCE_TOKEN = 4218
 
@@ -272,6 +304,13 @@ def _graphable_fixed_cfm3_solve(
         raise RuntimeError("fixed CFM3 graph received the wrong time embedding count")
     if int(dts.shape[0]) != _CERTIFIED_CFM_STEPS:
         raise RuntimeError("fixed CFM3 graph received the wrong timestep count")
+    if (cnn_cache is None) != (att_cache is None):
+        raise RuntimeError("fixed CFM graph received an unpaired estimator cache")
+    if cnn_cache is not None:
+        if int(cnn_cache.shape[0]) != _CERTIFIED_CFM_STEPS:
+            raise RuntimeError("fixed CFM graph received the wrong CNN cache step count")
+        if int(att_cache.shape[0]) != _CERTIFIED_CFM_STEPS:
+            raise RuntimeError("fixed CFM graph received the wrong attention cache step count")
 
     batch_size = int(x.shape[0])
     next_cnn: list[torch.Tensor] = []
@@ -415,9 +454,10 @@ class _ResidentCFM3GraphPair:
         self.prompt_frames = int(prompt_frames)
         self.expected_roles = (
             _prompt_role(self.prompt_frames),
-            _steady_role_for_lengths(self.prompt_frames, self.prompt_frames),
-            _steady_role_for_lengths(self.prompt_frames, self.prompt_frames + 50),
-            _steady_role_for_lengths(self.prompt_frames, self.prompt_frames + 100),
+            *(
+                _steady_role_for_lengths(self.prompt_frames, self.prompt_frames + offset)
+                for offset in _CERTIFIED_STEADY_CACHE_OFFSETS
+            ),
         )
         self.programs: dict[str, list[_ResidentGraphProgram]] = {}
         self._resident_outputs: dict[int, tuple[torch.Tensor, set[int]]] = {}
@@ -606,7 +646,7 @@ class _ResidentCFM3GraphPair:
             full_attention_width=int(expected_full_att.shape[4]),
         )
 
-        # The fourth transition is the first 402 -> 402 steady solve.  Capture
+        # The terminal cache transition is the first compact-cache steady solve.  Capture
         # the reverse edge into its resident source so future requests can
         # alternate without copying either cache.
         if role == self.expected_roles[-1]:
@@ -837,7 +877,11 @@ class Stage2EstimatorGraphBootstrap:
         self._expected_roles = frozenset(
             role for prompt_frames in self._allowed_prompt_frames for role in _roles_for_prompt_frames(prompt_frames)
         )
-        if len(self._expected_roles) != 4 * len(self._allowed_prompt_frames):
+        expected_role_count = sum(
+            len(_roles_for_prompt_frames(prompt_frames))
+            for prompt_frames in self._allowed_prompt_frames
+        )
+        if len(self._expected_roles) != expected_role_count:
             raise RuntimeError("runtime prompt role construction is not one-to-one")
         return rows
 
@@ -1361,14 +1405,15 @@ class Stage2EstimatorGraphBootstrap:
             self._internal_warmup = False
             self._evict_census(backend, census)
 
-        unique_prompt_lengths = len(self._allowed_prompt_frames)
-        expected_graphs = 4 * unique_prompt_lengths
-        expected_warm_solve_calls = _CERTIFIED_PROMPT_WAV_COUNT * 4
+        expected_graphs = len(self._expected_roles)
+        expected_warm_solve_calls = _CERTIFIED_PROMPT_WAV_COUNT * (
+            1 + len(_CERTIFIED_STEADY_CACHE_OFFSETS)
+        )
         expected = {
             "capture_requests": expected_graphs,
             "captures": expected_graphs,
             "capture_failures": 0,
-            # One fixed solve graph owns all three CFM steps for each role.
+            # One fixed solve graph owns all certified CFM steps for each role.
             # Startup state stays stock-owned; replay is validation-only.
             "shadow_replay_successes": expected_warm_solve_calls,
             "shadow_replay_failures": 0,
@@ -1426,6 +1471,18 @@ class Stage2EstimatorGraphBootstrap:
             model_default_prompt=str(self.model._default_prompt_wav),
         )
         census = self._build_prompt_census(backend)
+        available_noise_width = int(backend.flow.decoder.rand_noise.shape[2])
+        required_noise_width = max(
+            _required_rand_noise_width(row.prompt_frames, _CERTIFIED_ESTIMATOR_WIDTH)
+            for row in self._prompt_census
+        )
+        if available_noise_width < required_noise_width:
+            self._evict_census(backend, census)
+            raise RuntimeError(
+                "MiniCPM Stage2 CFM1/ccf graph rand_noise capacity is insufficient "
+                f"required={required_noise_width} available={available_noise_width} "
+                f"codec_chunk_frames={_CERTIFIED_CODEC_CHUNK_FRAMES}"
+            )
         prompt_contract = {
             "profile": self.profile,
             "prompt_manifest_mode": str(self._extra().get(_PROMPT_MANIFEST_MODE_KEY, "")),

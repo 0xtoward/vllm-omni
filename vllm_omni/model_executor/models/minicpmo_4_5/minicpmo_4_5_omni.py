@@ -286,6 +286,50 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return self.get_input_embeddings(input_ids)
         return super().embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
 
+    @property
+    def supports_codec_embed_graph(self) -> bool:
+        return bool(
+            self.model_stage == "tts"
+            and self.talker is not None
+            and getattr(self.talker, "supports_codec_embed_graph", False)
+        )
+
+    def set_codec_embed_graph_active(self, active: bool) -> None:
+        if self.model_stage != "tts" or self.talker is None:
+            if active:
+                raise RuntimeError(
+                    "codec-embedding graph selector used outside Talker stage"
+                )
+            return
+        self.talker.set_codec_embed_graph_active(active)
+
+    def preprocess_c1_decode_into(
+        self,
+        info_dict: dict[str, Any],
+        out: torch.Tensor,
+    ) -> bool:
+        """Delegate the strict Talker C1 embedding fast path to stage 1."""
+
+        return bool(
+            self.model_stage == "tts"
+            and self.talker is not None
+            and self.talker.preprocess_c1_decode_into(info_dict, out)
+        )
+
+    def can_skip_model_sampler_output_token_history(
+        self,
+        sampling_metadata: Any,
+    ) -> bool:
+        """Expose the Talker's binary-controller history contract to the runner."""
+
+        return bool(
+            self.model_stage == "tts"
+            and self.talker is not None
+            and self.talker.can_skip_model_sampler_output_token_history(
+                sampling_metadata
+            )
+        )
+
     def preprocess(
         self,
         input_ids: torch.Tensor,

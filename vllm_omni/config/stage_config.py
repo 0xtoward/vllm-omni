@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import re
 import warnings
 from collections.abc import Callable
@@ -681,6 +682,28 @@ def _apply_minicpmo_4_5_npu_connector_defaults(
         extra = connector.setdefault("extra", {})
         if not isinstance(extra, dict):
             continue
+        applied: dict[str, Any] = {}
+        if _MINICPMO_4_5_NPU_CCF50_EXPERIMENT:
+            configured_chunk = extra.get("codec_chunk_frames")
+            if configured_chunk is None:
+                extra["codec_chunk_frames"] = 50
+                applied["codec_chunk_frames"] = 50
+            else:
+                try:
+                    configured_chunk = int(configured_chunk)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "MiniCPM-o CFM1/ccf50 experiment requires an integer "
+                        "codec_chunk_frames"
+                    ) from exc
+                if configured_chunk not in {25, 50}:
+                    raise ValueError(
+                        "MiniCPM-o CFM1/ccf50 experiment only promotes the "
+                        f"shipped codec_chunk_frames=25, got {configured_chunk}"
+                    )
+                if configured_chunk == 25:
+                    extra["codec_chunk_frames"] = 50
+                    applied["codec_chunk_frames"] = 50
         defaults = {
             "token2wav_n_timesteps": _MINICPMO_4_5_NPU_DENOISE_STEPS,
             "code2wav_npu_graph_mode": _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_MODE,
@@ -689,7 +712,6 @@ def _apply_minicpmo_4_5_npu_connector_defaults(
                 _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROMPT_MODE
             ),
         }
-        applied: dict[str, Any] = {}
         for key, value in defaults.items():
             if key not in extra:
                 extra[key] = value
@@ -958,10 +980,17 @@ _MINICPMO_4_5_SHIPPED_GRAPH_MODE = "PIECEWISE"
 # connector, sparse-output, placement, allocator, or other all-in changes.
 # here rather than in the model module because editing a model module changes
 # its source hash and invalidates vLLM's modelinfos cache.
-_MINICPMO_4_5_NPU_DENOISE_STEPS = 3
+_MINICPMO_4_5_NPU_DENOISE_STEPS = 1
 _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_MODE = "on"
+_MINICPMO_4_5_NPU_CCF50_EXPERIMENT_ENV = "VLLM_OMNI_MINICPMO45_CFM1_CCF50_EXPERIMENT"
+_MINICPMO_4_5_NPU_CCF50_EXPERIMENT = os.environ.get(
+    _MINICPMO_4_5_NPU_CCF50_EXPERIMENT_ENV,
+    "1",
+).strip().lower() in {"1", "true", "yes", "on"}
 _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROFILE = (
-    "cfm3_ccf25_b1_model_default_prompt_v1"
+    "cfm1_ccf50_b1_model_default_prompt_v1"
+    if _MINICPMO_4_5_NPU_CCF50_EXPERIMENT
+    else "cfm1_ccf25_b1_model_default_prompt_v1"
 )
 _MINICPMO_4_5_NPU_CODE2WAV_GRAPH_PROMPT_MODE = "model_default"
 
@@ -986,6 +1015,28 @@ def _apply_minicpmo_4_5_npu_graph_defaults(
         platform = device_name.lower() if device_name is not None else None
     if platform != "npu":
         return
+
+    # The challenge contract is strict single-concurrency.  Serialize any
+    # accuracy-suite burst internally and use the second logical die only for
+    # Code2Wav, leaving Thinker and Talker on die 0.  An explicit opt-out keeps
+    # the source usable on one-die development hosts.
+    single_die = os.environ.get(
+        "VLLM_OMNI_MINICPMO45_SINGLE_DIE", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    for stage in deploy.stages:
+        if stage.max_num_seqs is None or stage.max_num_seqs > 1:
+            stage.max_num_seqs = 1
+        if (
+            stage.stage_id == 2
+            and not single_die
+            and stage.devices == "0"
+        ):
+            stage.devices = "1"
+            logger.info(
+                "MiniCPM-o 4.5 Stage2 placement: logical die 0 -> 1 "
+                "(C=1 challenge default)"
+            )
+
     for stage in deploy.stages:
         if stage.stage_id not in _MINICPMO_4_5_NPU_FULL_DECODE_STAGE_IDS:
             continue

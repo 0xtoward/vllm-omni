@@ -315,6 +315,13 @@ class StageRuntime:
         if runtime_cfg is None:
             runtime_cfg = {}
         devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+        # A captured ``None`` means the launcher had no outer visibility mask.
+        # Do not let a concurrently scoped sibling launch become an accidental
+        # mapping baseline (e.g. Stage2=1 making later Stage1 0 map to 1).
+        if self._init_visible_devices_baseline is None:
+            if devices in (None, "cpu"):
+                return None
+            return str(devices)
         return resolve_stage_physical_devices(
             stage_id,
             devices,

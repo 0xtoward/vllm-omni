@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import time
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -36,6 +37,94 @@ logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+
+
+def _install_stage1_host_ledger(engine_core: Any, stage_id: int | None) -> None:
+    """Install a low-overhead, opt-in Stage1 EngineCore wall-time ledger.
+
+    The executor calls are asynchronous, so their wrapper timings measure host
+    submission only.  ``step_fn`` includes the future wait, while
+    ``_process_engine_step`` additionally includes output queueing and
+    ``post_step``.  The residuals therefore expose where the per-token wall
+    time is actually spent without adding device synchronizations.
+    """
+    if stage_id != 1 or os.environ.get(
+        "VLLM_OMNI_MINICPMO45_STAGE1_HOST_LEDGER", "0"
+    ) != "1":
+        return
+
+    totals_ns = {
+        "schedule": 0,
+        "execute_submit": 0,
+        "sample_submit": 0,
+        "update": 0,
+        "step": 0,
+        "process_step": 0,
+    }
+    counts = {name: 0 for name in totals_ns}
+
+    def wrap_method(owner: Any, name: str, bucket: str) -> None:
+        original = getattr(owner, name)
+
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            before = time.perf_counter_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                totals_ns[bucket] += time.perf_counter_ns() - before
+                counts[bucket] += 1
+
+        setattr(owner, name, timed)
+
+    wrap_method(engine_core.scheduler, "schedule", "schedule")
+    wrap_method(engine_core.scheduler, "update_from_output", "update")
+    wrap_method(engine_core.model_executor, "execute_model", "execute_submit")
+    wrap_method(engine_core.model_executor, "sample_tokens", "sample_submit")
+    wrap_method(engine_core, "step_fn", "step")
+
+    original_process_step = engine_core._process_engine_step
+
+    def timed_process_step() -> bool:
+        before = time.perf_counter_ns()
+        try:
+            return original_process_step()
+        finally:
+            totals_ns["process_step"] += time.perf_counter_ns() - before
+            counts["process_step"] += 1
+            if counts["process_step"] % 128 == 0:
+                means_us = {
+                    name: totals_ns[name] / max(counts[name], 1) / 1_000
+                    for name in totals_ns
+                }
+                step_residual_us = max(
+                    means_us["step"]
+                    - means_us["schedule"]
+                    - means_us["execute_submit"]
+                    - means_us["sample_submit"]
+                    - means_us["update"],
+                    0.0,
+                )
+                output_post_us = max(
+                    means_us["process_step"] - means_us["step"], 0.0
+                )
+                logger.info(
+                    "MINICPMO45_STAGE1_HOST_LEDGER calls=%s means_us=%s "
+                    "step_residual_us=%.3f output_post_us=%.3f",
+                    counts,
+                    means_us,
+                    step_residual_us,
+                    output_post_us,
+                )
+
+    engine_core._process_engine_step = timed_process_step
+    logger.info(
+        "MINICPMO45_STAGE1_HOST_LEDGER event=installed executor=%s "
+        "step_fn=%s batch_queue_size=%s async_scheduling=%s",
+        type(engine_core.model_executor).__name__,
+        getattr(engine_core.step_fn, "__name__", type(engine_core.step_fn).__name__),
+        getattr(engine_core, "batch_queue_size", None),
+        getattr(engine_core, "async_scheduling", None),
+    )
 
 
 def _signal_exit_code(signum: int) -> int:
@@ -136,6 +225,7 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_index=dp_rank,
                 **kwargs,
             )
+            _install_stage1_host_ledger(engine_core, omni_stage_id)
 
             # Each subprocess corresponds to exactly one omni replica with
             # its own OmniMasterServer allocation, so the heartbeat client

@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import os
 import time
+from collections import Counter
 from collections.abc import Mapping
 from copy import copy, deepcopy
+from dataclasses import dataclass
+from functools import wraps
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -32,13 +36,17 @@ from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerA
 from vllm.v1.worker.mamba_utils import preprocess_mamba
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionState,
+    AscendMetadata,
+)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.utils import enable_sp, global_stream
+from vllm_ascend.utils import enable_sp, global_stream, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
@@ -83,6 +91,144 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
                 type(val).__name__,
             )
     return result
+
+
+_MINICPMO45_C1_CPU_SLOT_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_C1_CPU_SLOT_MAPPING"
+_MINICPMO45_STAGE1_HOST_LEDGER_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_HOST_LEDGER"
+_MINICPMO45_C1_FAST_PREP_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_C1_FAST_PREP"
+_MINICPMO45_C1_HOST_FAST_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_C1_HOST_FASTPATH"
+_MINICPMO45_C1_EXECUTION_PLAN_ENV = (
+    "VLLM_OMNI_MINICPMO45_STAGE1_C1_EXECUTION_PLAN"
+)
+_MINICPMO45_CODEC_EMBED_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_EMBED_GRAPH"
+
+
+@dataclass(frozen=True, slots=True)
+class _C1DecodeFastStep:
+    """One strict single-request Talker decode step owned by the fast lane."""
+
+    req_id: str
+    position: int
+
+
+@dataclass(slots=True)
+class _C1ExecutionPlan:
+    """Reusable host-only plan for one uninterrupted strict C=1 decode run.
+
+    It owns no KV values.  It retains only views into persistent metadata
+    buffers and one immutable FULL graph dispatch result.  Request, position,
+    object identity, and storage identity are checked before every replay.
+    """
+
+    req_id: str
+    last_position: int
+    table_obj_id: int
+    block_storage_ptr: int
+    slot_storage_ptr: int
+    seq_storage_ptr: int
+    determine_result: tuple[
+        CUDAGraphMode,
+        BatchDescriptor,
+        bool,
+        torch.Tensor | None,
+        CUDAGraphStat | None,
+    ]
+    attn_metadata: PerLayerAttnMetadata | None = None
+    unique_metadata: tuple[AscendMetadata, ...] = ()
+
+
+
+def _stage1_host_ledger(bucket: str):
+    """Time one runner method when the opt-in Stage1 ledger is active."""
+
+    def decorate(fn):
+        @wraps(fn)
+        def timed(self, *args, **kwargs):
+            if not getattr(self, "_stage1_host_ledger_enabled", False):
+                return fn(self, *args, **kwargs)
+            before = time.perf_counter_ns()
+            before_cpu = time.thread_time_ns()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                self._record_stage1_host_ledger(
+                    bucket,
+                    time.perf_counter_ns() - before,
+                    time.thread_time_ns() - before_cpu,
+                )
+
+        return timed
+
+    return decorate
+
+
+def _parse_bool_env(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean string, got {raw!r}")
+
+
+def _c1_cpu_slot_from_table(block_table: Any, position: int) -> int | None:
+    """Resolve one decode slot from the authoritative CPU block-table row.
+
+    The block-table manager updates this row before input preparation.  Read it
+    at each step so physical block reuse remains visible, and preserve the
+    physical/logical split used by hybrid block tables.  Returning ``None`` is
+    always a request to use the stock NPU slot-mapping implementation.
+    """
+
+    try:
+        position = int(position)
+        physical_block_size = int(block_table.physical_block_size)
+        block_size = int(block_table.block_size)
+        blocks_per_phys_block = int(block_table.blocks_per_phys_block)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        position < 0
+        or physical_block_size <= 0
+        or block_size <= 0
+        or blocks_per_phys_block <= 0
+    ):
+        return None
+
+    physical_index, physical_offset = divmod(position, physical_block_size)
+    logical_index = (
+        physical_index * blocks_per_phys_block
+        + physical_offset // block_size
+    )
+    try:
+        num_blocks_per_row = block_table.num_blocks_per_row
+        num_blocks = int(num_blocks_per_row[0])
+        block_row = block_table.block_table.np
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if logical_index >= num_blocks:
+        return None
+
+    try:
+        invalid_row = (
+            block_row.ndim != 2
+            or block_row.shape[0] < 1
+            or logical_index >= block_row.shape[1]
+        )
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if invalid_row:
+        return None
+    try:
+        block_id = int(block_row[0, logical_index])
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if block_id < 0:
+        return None
+    return block_id * block_size + physical_offset % block_size
 
 
 class ExecuteModelState(NamedTuple):
@@ -142,15 +288,1071 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        hf_config = getattr(self.model_config, "hf_config", None)
+        self._c1_cpu_slot_enabled = bool(
+            _parse_bool_env(_MINICPMO45_C1_CPU_SLOT_ENV, default=True)
+            and getattr(self.model_config, "model_stage", None) == "tts"
+            and str(getattr(hf_config, "version", "")) == "4.5"
+        )
+        self._c1_cpu_slot_hits = 0
+        self._c1_cpu_slot_boundaries = 0
+        self._c1_cpu_slot_fallbacks: Counter[str] = Counter()
+        self._c1_fast_prep_enabled = bool(
+            _parse_bool_env(_MINICPMO45_C1_FAST_PREP_ENV, default=True)
+            and getattr(self.model_config, "model_stage", None) == "tts"
+            and str(getattr(hf_config, "version", "")) == "4.5"
+        )
+        self._c1_fast_step: _C1DecodeFastStep | None = None
+        self._c1_fast_static_ready = False
+        self._c1_fast_hits = 0
+        self._c1_fast_rejects: Counter[str] = Counter()
+        self._c1_fast_one_np = np.ones(1, dtype=np.int32)
+        self._c1_fast_query_lens = torch.from_numpy(self._c1_fast_one_np)
+        self._c1_fast_logits_indices: torch.Tensor | None = None
+
+        self._c1_execution_plan_enabled = bool(
+            _parse_bool_env(_MINICPMO45_C1_EXECUTION_PLAN_ENV, default=True)
+            and self._c1_fast_prep_enabled
+        )
+        self._c1_execution_plan: _C1ExecutionPlan | None = None
+        self._c1_execution_plan_captures = 0
+        self._c1_execution_plan_hits = 0
+        self._c1_execution_plan_rejects: Counter[str] = Counter()
+        if self._c1_execution_plan_enabled:
+            logger.info(
+                "MINICPMO45_STAGE1_C1_EXECUTION_PLAN event=enabled "
+                "default_off=true"
+            )
+        self._c1_host_fast_enabled = bool(
+            _parse_bool_env(_MINICPMO45_C1_HOST_FAST_ENV, default=False)
+            and self._c1_fast_prep_enabled
+        )
+        self._c1_host_fast_info: dict[str, Any] | None = None
+        self._c1_host_fast_infos: list[dict[str, Any]] = [{}]
+        self._c1_host_fast_spans = [(0, 1)]
+        self._c1_host_fast_sample_eligible = [True]
+        self._c1_host_fast_preprocess_hits = 0
+        self._c1_host_fast_kwargs_hits = 0
+        self._c1_host_fast_sampler_history_skips = 0
+        self._codec_embed_graph_enabled = bool(
+            _parse_bool_env(
+                _MINICPMO45_CODEC_EMBED_GRAPH_ENV, default=True
+            )
+            and self._c1_fast_prep_enabled
+        )
+        self._codec_embed_graph_hits = 0
+        self._stage1_host_ledger_enabled = bool(
+            os.environ.get(_MINICPMO45_STAGE1_HOST_LEDGER_ENV, "0") == "1"
+            and getattr(self.model_config, "model_stage", None) == "tts"
+            and str(getattr(hf_config, "version", "")) == "4.5"
+        )
+        self._stage1_host_ledger_ns: Counter[str] = Counter()
+        self._stage1_host_ledger_cpu_ns: Counter[str] = Counter()
+        self._stage1_host_ledger_counts: Counter[str] = Counter()
+        if self._stage1_host_ledger_enabled:
+            for name, bucket in (
+                ("_preprocess", "preprocess"),
+                ("_model_forward", "model_forward"),
+                ("extract_multimodal_outputs", "extract_multimodal"),
+                ("_bookkeeping_sync", "bookkeeping_sync"),
+                ("_sample", "sample_core"),
+            ):
+                self._wrap_stage1_host_ledger_method(self, name, bucket)
+
+    def _wrap_stage1_host_ledger_method(
+        self,
+        owner: Any,
+        name: str,
+        bucket: str,
+    ) -> None:
+        original = getattr(owner, name, None)
+        if not callable(original):
+            return
+
+        @wraps(original)
+        def timed(*args, **kwargs):
+            before = time.perf_counter_ns()
+            before_cpu = time.thread_time_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._record_stage1_host_ledger(
+                    bucket,
+                    time.perf_counter_ns() - before,
+                    time.thread_time_ns() - before_cpu,
+                )
+
+        setattr(owner, name, timed)
+
+    def _record_stage1_host_ledger(
+        self,
+        bucket: str,
+        elapsed_ns: int,
+        cpu_ns: int,
+    ) -> None:
+        self._stage1_host_ledger_ns[bucket] += elapsed_ns
+        self._stage1_host_ledger_cpu_ns[bucket] += cpu_ns
+        self._stage1_host_ledger_counts[bucket] += 1
+        if bucket != "sample_tokens":
+            return
+        calls = self._stage1_host_ledger_counts[bucket]
+        if calls % 128 != 0:
+            return
+        means_wall_us = {
+            name: self._stage1_host_ledger_ns[name]
+            / max(self._stage1_host_ledger_counts[name], 1)
+            / 1_000
+            for name in sorted(self._stage1_host_ledger_ns)
+        }
+        means_cpu_us = {
+            name: self._stage1_host_ledger_cpu_ns[name]
+            / max(self._stage1_host_ledger_counts[name], 1)
+            / 1_000
+            for name in sorted(self._stage1_host_ledger_cpu_ns)
+        }
+        logger.info(
+            "MINICPMO45_STAGE1_RUNNER_HOST_LEDGER calls=%s "
+            "means_wall_us=%s means_cpu_us=%s",
+            dict(self._stage1_host_ledger_counts),
+            means_wall_us,
+            means_cpu_us,
+        )
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        if self._stage1_host_ledger_enabled:
+            for name, bucket in (
+                ("forward", "model_module_forward"),
+                ("make_omni_output", "make_omni_output"),
+                ("compute_logits", "compute_logits"),
+            ):
+                self._wrap_stage1_host_ledger_method(self.model, name, bucket)
         self._resolve_duplex_sampling_hook(force=True)
 
+    @_stage1_host_ledger("update_states")
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
         return deferred_state_corrections_fn
+
+    def _c1_fast_reject_reason(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_scheduled_tokens: np.ndarray,
+    ) -> str | None:
+        """Return why the strict C=1 steady Talker lane cannot own this step."""
+
+        if not self._c1_fast_prep_enabled:
+            return "disabled"
+        if not self.use_async_scheduling:
+            return "not_async"
+        if int(self.input_batch.num_reqs) != 1:
+            return "not_c1"
+        if (
+            int(scheduler_output.total_num_scheduled_tokens) != 1
+            or len(num_scheduled_tokens) != 1
+            or int(num_scheduled_tokens[0]) != 1
+        ):
+            return "not_one_token"
+        if scheduler_output.scheduled_new_reqs:
+            return "new_request"
+        if scheduler_output.finished_req_ids:
+            return "finished_request"
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return "scheduled_spec_decode"
+        if self.speculative_config is not None or int(self.num_spec_tokens) != 0:
+            return "speculative_config"
+        if self.use_cp or int(self.pcp_size) != 1 or int(self.dcp_size) != 1:
+            return "context_parallel"
+        if get_pp_group().world_size != 1 or get_tp_group().world_size != 1:
+            return "model_parallel"
+        if int(self.vllm_config.parallel_config.data_parallel_size) != 1:
+            return "data_parallel"
+        if has_kv_transfer_group() or has_ec_transfer():
+            return "kv_or_ec_transfer"
+        if self.lora_config:
+            return "lora"
+        if self.uses_mrope or int(self.uses_xdrope_dim) > 0:
+            return "special_rope"
+        if self.enable_prompt_embeds or self.omni_prefix_cache is not None:
+            return "prompt_or_prefix_embeds"
+        if self.model_config.is_encoder_decoder:
+            return "encoder_decoder"
+        if scheduler_output.scheduled_encoder_inputs:
+            return "encoder_input"
+        if getattr(self, "use_compress", False):
+            return "compressed_kv"
+        if self.is_pooling_model:
+            return "pooling"
+        if self.has_talker_mtp:
+            return "talker_mtp"
+        if getattr(self, "_has_gdn", False):
+            return "gdn"
+        if self.cache_config.kv_sharing_fast_prefill:
+            return "kv_sharing_fast_prefill"
+        if lmhead_tp_enable():
+            return "lmhead_tp"
+        if self._c1_host_fast_enabled and (
+            self._omni_query_start_loc_model_kwarg
+            or getattr(self.model_config, "has_sampling_extra_args", False)
+        ):
+            return "extra_model_kwargs"
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        if capture_sizes and 1 not in capture_sizes:
+            return "missing_graph_bucket_one"
+
+        # Model-local preprocessing hooks are exposed through the runner's
+        # graph wrapper.  ``unwrap()`` returns the compiled forward module and
+        # is not required to retain non-forward Python helper methods.
+        fast_model = self.model
+        if self._codec_embed_graph_enabled and (
+            not bool(
+                getattr(fast_model, "supports_codec_embed_graph", False)
+            )
+            or not callable(
+                getattr(fast_model, "set_codec_embed_graph_active", None)
+            )
+        ):
+            return "missing_codec_embed_graph_model"
+        if callable(getattr(fast_model, "preprocess_batch", None)):
+            return "batch_preprocess"
+        if callable(getattr(fast_model, "preprocess_decode_batch", None)):
+            return "decode_batch_preprocess"
+
+        req_id = self.input_batch.req_ids[0]
+        if self.input_batch.req_id_to_index.get(req_id) != 0:
+            return "request_reordered"
+        position = int(self.input_batch.num_computed_tokens_cpu[0])
+        prompt_tokens = int(self.input_batch.num_prompt_tokens[0])
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return "missing_request"
+        prompt_token_ids = getattr(req_state, "prompt_token_ids", ())
+        prompt_len = len(prompt_token_ids or ())
+        if prompt_tokens != prompt_len:
+            return "prompt_length_mismatch"
+        if position < prompt_tokens or position < prompt_len:
+            return "prefill"
+        if position + 1 < int(req_state.num_tokens):
+            return "discarded_output"
+
+        cached_infos = getattr(
+            scheduler_output.scheduled_cached_reqs,
+            "additional_information",
+            None,
+        )
+        if isinstance(cached_infos, dict) and cached_infos.get(req_id):
+            return "cached_additional_information"
+        local_payloads = getattr(self, "_local_stage_payload_cache", None)
+        if isinstance(local_payloads, dict) and req_id in local_payloads:
+            return "local_stage_payload"
+        pending_payloads = getattr(
+            self,
+            "_full_payload_pending_broadcast_req_ids",
+            None,
+        )
+        if pending_payloads and req_id in pending_payloads:
+            return "pending_stage_payload"
+
+        prev_positions = self.input_batch.prev_req_id_to_index
+        if prev_positions.get(req_id) != 0:
+            return "missing_previous_request"
+        prev_tokens = self.input_batch.prev_sampled_token_ids
+        if (
+            not isinstance(prev_tokens, torch.Tensor)
+            or prev_tokens.ndim != 2
+            or prev_tokens.shape[0] < 1
+            or prev_tokens.shape[1] < 1
+        ):
+            return "missing_previous_token"
+
+        block_tables = self.input_batch.block_table.block_tables
+        if len(block_tables) != 1:
+            return "multiple_kv_groups"
+        table = block_tables[0]
+        if table.is_mamba_group:
+            return "mamba"
+        if int(table.pcp_world_size) != 1 or int(table.dcp_world_size) != 1:
+            return "kv_context_parallel"
+
+        info = self.model_intermediate_buffer.get(req_id)
+        if not isinstance(info, dict):
+            return "missing_audio_state"
+        if info.get("native_duplex") or info.get("resumable"):
+            return "streaming_session"
+        state = info.get("audio_state")
+        current = (info.get("audio_codes", {}) or {}).get("current")
+        if (
+            not isinstance(state, dict)
+            or state.get("finished")
+            or not isinstance(current, torch.Tensor)
+            or current.shape != (1,)
+            or current.dtype != torch.long
+            or current.device != self.device
+        ):
+            return "invalid_audio_state"
+        return None
+
+
+    def _c1_execution_plan_table_state(
+        self,
+    ) -> tuple[int, int, int, int] | None:
+        """Return identities for buffers whose views a plan may retain."""
+
+        try:
+            tables = self.input_batch.block_table.block_tables
+            if len(tables) != 1:
+                return None
+            table = tables[0]
+            block_tensor = table.get_device_tensor()
+            slot_tensor = table.slot_mapping.gpu
+            seq_tensor = self.optimistic_seq_lens_cpu
+            return (
+                id(table),
+                int(block_tensor.data_ptr()),
+                int(slot_tensor.data_ptr()),
+                int(seq_tensor.data_ptr()),
+            )
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def _discard_c1_execution_plan(self, reason: str) -> None:
+        plan = self._c1_execution_plan
+        if plan is None:
+            return
+        self._c1_execution_plan = None
+        self._c1_execution_plan_rejects[reason] += 1
+        rejects = sum(self._c1_execution_plan_rejects.values())
+        if rejects == 1 or rejects % 64 == 0 or reason.startswith("contract:"):
+            logger.info(
+                "MINICPMO45_STAGE1_C1_EXECUTION_PLAN event=discard "
+                "kind=%s reason=%s hits=%d captures=%d plan_request_id=%s "
+                "last_position=%d rejects=%s",
+                "contract" if reason.startswith("contract:") else "boundary",
+                reason,
+                self._c1_execution_plan_hits,
+                self._c1_execution_plan_captures,
+                plan.req_id,
+                plan.last_position,
+                dict(self._c1_execution_plan_rejects),
+            )
+
+    def _c1_execution_plan_matches(
+        self,
+        step: _C1DecodeFastStep,
+    ) -> bool:
+        plan = self._c1_execution_plan
+        state = self._c1_execution_plan_table_state()
+        if plan is None or state is None:
+            return False
+        return bool(
+            plan.req_id == step.req_id
+            and step.position == plan.last_position + 1
+            and state
+            == (
+                plan.table_obj_id,
+                plan.block_storage_ptr,
+                plan.slot_storage_ptr,
+                plan.seq_storage_ptr,
+            )
+        )
+
+    def _determine_batch_execution_and_padding(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        max_num_scheduled_tokens: int,
+        use_cascade_attn: bool,
+        allow_microbatching: bool = False,
+        force_eager: bool = False,
+        force_uniform_decode: bool | None = None,
+        force_has_lora: bool | None = None,
+        force_num_active_loras: int | None = None,
+        num_encoder_reqs: int = 0,
+    ) -> tuple[
+        CUDAGraphMode,
+        BatchDescriptor,
+        bool,
+        torch.Tensor | None,
+        CUDAGraphStat | None,
+    ]:
+        step = self._c1_fast_step
+        exact = bool(
+            self._c1_execution_plan_enabled
+            and step is not None
+            and num_tokens == 1
+            and num_reqs == 1
+            and num_scheduled_tokens_np.shape == (1,)
+            and int(num_scheduled_tokens_np[0]) == 1
+            and max_num_scheduled_tokens == 1
+            and not use_cascade_attn
+            and not allow_microbatching
+            and not force_eager
+            and force_uniform_decode is None
+            and force_has_lora is None
+            and force_num_active_loras is None
+            and num_encoder_reqs == 0
+        )
+        if exact and step is not None and self._c1_execution_plan_matches(step):
+            assert self._c1_execution_plan is not None
+            return self._c1_execution_plan.determine_result
+
+        if self._c1_execution_plan_enabled and step is not None:
+            old = self._c1_execution_plan
+            boundary = old is not None and old.req_id != step.req_id
+            self._discard_c1_execution_plan(
+                "boundary:new_request" if boundary else "contract:dispatch"
+            )
+        result = super()._determine_batch_execution_and_padding(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            use_cascade_attn=use_cascade_attn,
+            allow_microbatching=allow_microbatching,
+            force_eager=force_eager,
+            force_uniform_decode=force_uniform_decode,
+            force_has_lora=force_has_lora,
+            force_num_active_loras=force_num_active_loras,
+            num_encoder_reqs=num_encoder_reqs,
+        )
+        if not exact or step is None:
+            return result
+
+        cudagraph_mode, batch_desc, should_ubatch, across_dp, stats = result
+        state = self._c1_execution_plan_table_state()
+        valid = bool(
+            cudagraph_mode == CUDAGraphMode.FULL
+            and int(batch_desc.num_tokens) == 1
+            and batch_desc.num_reqs in (None, 1)
+            and not should_ubatch
+            and across_dp is None
+            and stats is None
+            and state is not None
+        )
+        if not valid or state is None:
+            return result
+        self._c1_execution_plan = _C1ExecutionPlan(
+            req_id=step.req_id,
+            last_position=step.position - 1,
+            table_obj_id=state[0],
+            block_storage_ptr=state[1],
+            slot_storage_ptr=state[2],
+            seq_storage_ptr=state[3],
+            determine_result=result,
+        )
+        return result
+
+    def _pad_query_start_loc_for_fia(
+        self,
+        query_start_loc: Any,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_reqs: int,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+        batch_desc_num_reqs: int | None = None,
+    ) -> int:
+        step = self._c1_fast_step
+        exact = bool(
+            self._c1_execution_plan_enabled
+            and step is not None
+            and self._c1_execution_plan_matches(step)
+            and query_start_loc is self.query_start_loc
+            and num_tokens_padded == 1
+            and num_reqs_padded == 1
+            and num_reqs == 1
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and batch_desc_num_reqs in (None, 1)
+        )
+        if exact:
+            # Fast preparation sealed [0, 1] once for this uninterrupted run.
+            return 1
+        if self._c1_execution_plan_enabled and step is not None:
+            self._discard_c1_execution_plan("contract:fia_padding")
+        return super()._pad_query_start_loc_for_fia(
+            query_start_loc,
+            num_tokens_padded,
+            num_reqs_padded,
+            num_reqs,
+            cudagraph_runtime_mode,
+            batch_desc_num_reqs,
+        )
+
+    def _build_attention_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        max_query_len: int,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        ubatch_slices: Any | None = None,
+        logits_indices: torch.Tensor | None = None,
+        use_spec_decode: bool = False,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens: dict[str, int] | None = None,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+        cascade_attn_prefix_lens: list[list[int]] | None = None,
+    ) -> tuple[PerLayerAttnMetadata, Any | None]:
+        step = self._c1_fast_step
+        exact = bool(
+            self._c1_execution_plan_enabled
+            and step is not None
+            and self._c1_execution_plan_matches(step)
+            and num_tokens == 1
+            and num_reqs == 1
+            and max_query_len == 1
+            and num_tokens_padded == 1
+            and num_reqs_padded == 1
+            and ubatch_slices is None
+            and not use_spec_decode
+            and not for_cudagraph_capture
+            and cascade_attn_prefix_lens is None
+            and num_scheduled_tokens_np is not None
+            and num_scheduled_tokens_np.shape == (1,)
+            and int(num_scheduled_tokens_np[0]) == 1
+        )
+        plan = self._c1_execution_plan if exact else None
+        if plan is not None and plan.attn_metadata is not None:
+            next_seq_len = step.position + 1
+            for metadata in plan.unique_metadata:
+                storage_ok = bool(
+                    len(metadata.seq_lens_list) == 1
+                    and metadata.seq_lens is not None
+                    and int(metadata.seq_lens.data_ptr()) == plan.seq_storage_ptr
+                    and metadata.block_tables is not None
+                    and int(metadata.block_tables.data_ptr())
+                    == plan.block_storage_ptr
+                    and metadata.slot_mapping is not None
+                    and int(metadata.slot_mapping.data_ptr())
+                    == plan.slot_storage_ptr
+                )
+                if not storage_ok:
+                    self._discard_c1_execution_plan(
+                        "contract:cached_metadata_storage"
+                    )
+                    plan = None
+                    break
+                metadata.seq_lens_list[0] = next_seq_len
+            if plan is not None:
+                plan.last_position = step.position
+                self._c1_execution_plan_hits += 1
+                if (
+                    self._c1_execution_plan_hits == 1
+                    or self._c1_execution_plan_hits % 64 == 0
+                ):
+                    logger.info(
+                        "MINICPMO45_STAGE1_C1_EXECUTION_PLAN event=replay "
+                        "hits=%d captures=%d request_id=%s position=%d",
+                        self._c1_execution_plan_hits,
+                        self._c1_execution_plan_captures,
+                        step.req_id,
+                        step.position,
+                    )
+                return plan.attn_metadata, None
+
+        if self._c1_execution_plan_enabled and step is not None and not exact:
+            self._discard_c1_execution_plan("contract:attention")
+        result = super()._build_attention_metadata(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            ubatch_slices=ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+        )
+        if plan is None:
+            return result
+
+        attn_metadata, spec_common = result
+        if spec_common is not None or not isinstance(attn_metadata, dict):
+            self._discard_c1_execution_plan("contract:metadata_container")
+            return result
+        unique_metadata = tuple(
+            {id(metadata): metadata for metadata in attn_metadata.values()}.values()
+        )
+        valid = bool(unique_metadata)
+        for metadata in unique_metadata:
+            valid = bool(
+                valid
+                and isinstance(metadata, AscendMetadata)
+                and metadata.attn_state == AscendAttentionState.DecodeOnly
+                and metadata.num_actual_tokens == 1
+                and metadata.num_decode_tokens == 1
+                and metadata.num_decodes == 1
+                and metadata.num_prefills == 0
+                and metadata.actual_seq_lengths_q == [1]
+                and isinstance(metadata.seq_lens_list, list)
+                and len(metadata.seq_lens_list) == 1
+                and metadata.seq_lens is not None
+                and int(metadata.seq_lens.data_ptr()) == plan.seq_storage_ptr
+                and metadata.block_tables is not None
+                and int(metadata.block_tables.data_ptr())
+                == plan.block_storage_ptr
+                and metadata.slot_mapping is not None
+                and int(metadata.slot_mapping.data_ptr())
+                == plan.slot_storage_ptr
+                and metadata.query_start_loc is not None
+                and metadata.query_start_loc.numel() == 2
+            )
+            if not valid:
+                break
+        if not valid:
+            self._discard_c1_execution_plan(
+                "contract:metadata_shape_or_storage"
+            )
+            return result
+
+        plan.attn_metadata = attn_metadata
+        plan.unique_metadata = unique_metadata
+        plan.last_position = step.position
+        self._c1_execution_plan_captures += 1
+        logger.info(
+            "MINICPMO45_STAGE1_C1_EXECUTION_PLAN event=capture "
+            "captures=%d request_id=%s position=%d layers=%d metadata=%d",
+            self._c1_execution_plan_captures,
+            step.req_id,
+            step.position,
+            len(attn_metadata),
+            len(unique_metadata),
+        )
+        return result
+
+
+    def _initialize_c1_fast_static_buffers(self) -> None:
+        """Initialize metadata that is invariant for strict C=1 K=1 decode."""
+
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1] = 1
+        self.query_start_loc.np[2:].fill(1)
+        self.query_start_loc.copy_to_gpu()
+        self.query_start_loc.gpu[2:].fill_(-1)
+        self.req_indices.np[0] = 0
+        self.req_indices.copy_to_gpu(1)
+        self.query_pos.np[0] = 0
+        self.query_pos.copy_to_gpu(1)
+        self.num_scheduled_tokens.np[0] = 1
+        self.num_scheduled_tokens.copy_to_gpu(1)
+        self.num_accepted_tokens.np.fill(1)
+        self.num_accepted_tokens.gpu.fill_(1)
+        self.discard_request_mask.np[0] = False
+        self.discard_request_mask.copy_to_gpu(1)
+        self.optimistic_seq_lens_cpu[1:].fill_(0)
+        self.seq_lens[1:].fill_(0)
+        self._c1_fast_logits_indices = torch.zeros_like(
+            self.query_start_loc.gpu[:1],
+        )
+        self._c1_fast_static_ready = True
+
+    def _prepare_inputs_c1_decode(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[torch.Tensor, None, int]:
+        """Prepare only the mutable metadata for one steady Talker token."""
+
+        if not self._c1_fast_static_ready:
+            self._initialize_c1_fast_static_buffers()
+        assert self._c1_fast_logits_indices is not None
+
+        req_id = self.input_batch.req_ids[0]
+        position = int(self.input_batch.num_computed_tokens_cpu[0])
+        table_group = self.input_batch.block_table
+        table_group.commit_block_table(1)
+
+        # Reuse the copy that stock input preparation already performs.
+        # The ordinary runner token is the binary continue/stop controller;
+        # the graph-embedding lane instead needs the request-local codec id.
+        if self._codec_embed_graph_enabled:
+            info = self.model_intermediate_buffer.get(req_id)
+            current = (info.get("audio_codes", {}) or {}).get("current")
+            if (
+                not isinstance(current, torch.Tensor)
+                or current.shape != (1,)
+                or current.dtype != torch.long
+                or current.device != self.device
+            ):
+                raise RuntimeError(
+                    "MiniCPM-o codec-embedding graph lost the authoritative codec token"
+                )
+            self.input_ids.gpu[:1].copy_(current, non_blocking=True)
+        else:
+            # Async scheduling keeps the authoritative runner sample on
+            # device; token_ids_cpu is a placeholder until scheduler commit.
+            self.input_ids.gpu[:1].copy_(
+                self.input_batch.prev_sampled_token_ids[:1, 0],
+                non_blocking=True,
+            )
+
+        self.optimistic_seq_lens_cpu[0] = position + 1
+        computed_cpu = self.input_batch.num_computed_tokens_cpu_tensor[:1]
+        self.num_computed_tokens[:1].copy_(computed_cpu, non_blocking=True)
+        self.positions[:1].copy_(computed_cpu, non_blocking=True)
+        self.seq_lens[:1].copy_(
+            self.optimistic_seq_lens_cpu[:1],
+            non_blocking=True,
+        )
+
+        # Keep the stock paged-KV writer and its 4-D cache contract.  For the
+        # strict C=1 lane the authoritative CPU block-table row already names
+        # the physical block, so resolve the one scalar slot without launching
+        # the general NPU slot-mapping kernel.  Any inconsistent table state
+        # falls back to the established implementation.
+        table = table_group.block_tables[0]
+        slot = (
+            _c1_cpu_slot_from_table(table, position)
+            if self._c1_cpu_slot_enabled
+            else None
+        )
+        if slot is None:
+            table_group.compute_slot_mapping(
+                1,
+                self.query_start_loc.gpu[:2],
+                self.positions[:1],
+            )
+            if self._c1_cpu_slot_enabled:
+                self._c1_cpu_slot_fallbacks["invalid_block_index"] += 1
+        else:
+            table.slot_mapping.np[0] = slot
+            table.slot_mapping.copy_to_gpu(1)
+            self._c1_cpu_slot_hits += 1
+            if position > 0 and position % int(table.physical_block_size) == 0:
+                self._c1_cpu_slot_boundaries += 1
+            if self._c1_cpu_slot_hits == 1 or self._c1_cpu_slot_hits % 512 == 0:
+                logger.info(
+                    "MiniCPMO45Stage1C1FastCPUSlot hits=%d boundaries=%d "
+                    "fallbacks=%s position=%d slot=%d",
+                    self._c1_cpu_slot_hits,
+                    self._c1_cpu_slot_boundaries,
+                    dict(self._c1_cpu_slot_fallbacks),
+                    position,
+                    slot,
+                )
+        self.num_discarded_requests = 0
+        self.query_lens = self._c1_fast_query_lens
+        self.attn_state = AscendAttentionState.DecodeOnly
+        self.with_prefill = False
+        self.logits_indices = self._c1_fast_logits_indices
+        self._c1_fast_step = _C1DecodeFastStep(req_id=req_id, position=position)
+        self._c1_fast_hits += 1
+        if self._c1_fast_hits == 1 or self._c1_fast_hits % 512 == 0:
+            logger.info(
+                "MINICPMO45_STAGE1_C1_FAST_PREP hits=%d rejects=%s "
+                "request_id=%s position=%d",
+                self._c1_fast_hits,
+                dict(self._c1_fast_rejects),
+                req_id,
+                position,
+            )
+        return self._c1_fast_logits_indices, None, 1
+
+    def _c1_cpu_slot_reject_reason(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_scheduled_tokens: np.ndarray,
+    ) -> str | None:
+        if not self._c1_cpu_slot_enabled:
+            return "disabled"
+        if int(self.input_batch.num_reqs) != 1:
+            return "not_c1"
+        if int(scheduler_output.total_num_scheduled_tokens) != 1:
+            return "not_one_token"
+        if len(num_scheduled_tokens) != 1 or int(num_scheduled_tokens[0]) != 1:
+            return "not_one_token"
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return "scheduled_spec_decode"
+        if self.speculative_config is not None:
+            return "speculative_config"
+        if getattr(self, "use_compress", False):
+            return "compressed_kv"
+        if int(self.pcp_size) != 1:
+            return "pcp"
+
+        position = int(self.input_batch.num_computed_tokens_cpu[0])
+        prompt_tokens = int(self.input_batch.num_prompt_tokens[0])
+        if position < prompt_tokens:
+            return "prefill"
+
+        block_tables = self.input_batch.block_table.block_tables
+        if len(block_tables) != 1:
+            return "multiple_kv_groups"
+        table = block_tables[0]
+        if table.is_mamba_group:
+            return "mamba"
+        if int(table.pcp_world_size) != 1 or int(table.dcp_world_size) != 1:
+            return "context_parallel"
+        if _c1_cpu_slot_from_table(table, position) is None:
+            return "invalid_block_index"
+        return None
+
+    @_stage1_host_ledger("prepare_inputs")
+    def _prepare_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_scheduled_tokens: np.ndarray,
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
+        """Bypass the general NPU slot mapper for strict C=1 Talker decode.
+
+        The temporary wrapper is visible only while the upstream Ascend input
+        preparation runs.  Every rejected mode and every runtime inconsistency
+        calls the original mapper with the original arguments.  The instance
+        method is restored even if upstream preparation raises.
+        """
+
+        self._c1_fast_step = None
+        self._c1_host_fast_info = None
+        try:
+            fast_reject = self._c1_fast_reject_reason(
+                scheduler_output,
+                num_scheduled_tokens,
+            )
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            fast_reject = "invalid_metadata"
+        if fast_reject is None:
+            return self._prepare_inputs_c1_decode(scheduler_output)
+        if self._c1_fast_prep_enabled:
+            # The generic path is allowed to mutate every reusable metadata
+            # buffer (for example a 25-token prefill writes
+            # query_start_loc=[0, 25]). Static here means static only within
+            # one uninterrupted C1 decode run, never process-lifetime static.
+            # Force the next eligible step to reseal those buffers.
+            self._c1_fast_static_ready = False
+            self._discard_c1_execution_plan(f"boundary:{fast_reject}")
+            self._c1_fast_rejects[fast_reject] += 1
+            rejects = sum(self._c1_fast_rejects.values())
+            if rejects == 1 or rejects % 512 == 0:
+                logger.info(
+                    "MINICPMO45_STAGE1_C1_FAST_PREP event=reject "
+                    "rejects=%s",
+                    dict(self._c1_fast_rejects),
+                )
+
+        if not self._c1_cpu_slot_enabled:
+            return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+
+        multi_table = self.input_batch.block_table
+        had_instance_compute = "compute_slot_mapping" in multi_table.__dict__
+        old_instance_compute = multi_table.__dict__.get("compute_slot_mapping")
+        stock_compute = multi_table.compute_slot_mapping
+        try:
+            reject_reason = self._c1_cpu_slot_reject_reason(
+                scheduler_output,
+                num_scheduled_tokens,
+            )
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            reject_reason = "invalid_metadata"
+
+        def compute_slot_mapping(
+            num_reqs: int,
+            query_start_loc: torch.Tensor,
+            positions: torch.Tensor,
+            positions_compressed_list: list[np.ndarray] | None = None,
+            req_indices_compressed_list: list[np.ndarray] | None = None,
+        ) -> None:
+            dynamic_reject = reject_reason
+            if (
+                positions_compressed_list is not None
+                or req_indices_compressed_list is not None
+            ):
+                dynamic_reject = "compressed_kv"
+            if dynamic_reject is not None:
+                self._c1_cpu_slot_fallbacks[dynamic_reject] += 1
+                stock_compute(
+                    num_reqs,
+                    query_start_loc,
+                    positions,
+                    positions_compressed_list,
+                    req_indices_compressed_list,
+                )
+                return
+
+            table = multi_table.block_tables[0]
+            position = int(self.input_batch.num_computed_tokens_cpu[0])
+            slot = _c1_cpu_slot_from_table(table, position)
+            if slot is None:
+                self._c1_cpu_slot_fallbacks["invalid_block_index"] += 1
+                stock_compute(
+                    num_reqs,
+                    query_start_loc,
+                    positions,
+                    positions_compressed_list,
+                    req_indices_compressed_list,
+                )
+                return
+
+            table.slot_mapping.np[0] = slot
+            table.slot_mapping.copy_to_gpu(1)
+            self._c1_cpu_slot_hits += 1
+            if position > 0 and position % int(table.physical_block_size) == 0:
+                self._c1_cpu_slot_boundaries += 1
+            if self._c1_cpu_slot_hits == 1 or self._c1_cpu_slot_hits % 512 == 0:
+                logger.info(
+                    "MiniCPMO45Stage1CPUSlotFastPath hits=%d boundaries=%d "
+                    "fallbacks=%s position=%d slot=%d",
+                    self._c1_cpu_slot_hits,
+                    self._c1_cpu_slot_boundaries,
+                    dict(self._c1_cpu_slot_fallbacks),
+                    position,
+                    slot,
+                )
+
+        multi_table.compute_slot_mapping = compute_slot_mapping
+        try:
+            return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        finally:
+            if had_instance_compute:
+                multi_table.__dict__["compute_slot_mapping"] = old_instance_compute
+            else:
+                del multi_table.__dict__["compute_slot_mapping"]
+
+    def _preprocess(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_input_tokens: int,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ):
+        """Use a sealed MiniCPM Talker decode embedding lane when prepared."""
+
+        step = self._c1_fast_step
+        self._c1_fast_step = None
+        set_codec_embed_active = getattr(
+            self.model, "set_codec_embed_graph_active", None
+        )
+        if step is None:
+            if self._codec_embed_graph_enabled:
+                if not callable(set_codec_embed_active):
+                    raise RuntimeError(
+                        "MiniCPM-o codec-embedding graph lost its model selector"
+                    )
+                set_codec_embed_active(False)
+            return super()._preprocess(
+                scheduler_output,
+                num_input_tokens,
+                intermediate_tensors,
+            )
+        if (
+            num_input_tokens != 1
+            or intermediate_tensors is not None
+            or self.input_batch.req_ids[0] != step.req_id
+        ):
+            raise RuntimeError(
+                "MiniCPM-o C1 fast preprocess contract changed after input preparation"
+            )
+
+        # Preserve dynamic request metadata refreshes; the expensive generic
+        # modality/request loop is unnecessary for one established decode row.
+        self._update_additional_information(scheduler_output)
+        if not self.vllm_config.model_config.async_chunk:
+            self._sync_local_stage_payloads()
+        info = self.model_intermediate_buffer.get(step.req_id)
+        preprocess = getattr(self.model, "preprocess", None)
+        if not isinstance(info, dict) or not callable(preprocess):
+            raise RuntimeError(
+                "MiniCPM-o C1 fast preprocess eligibility changed within one step"
+            )
+
+        # Match the request-local metadata refresh performed by the generic
+        # Omni preprocessing loop.  These values are part of the model
+        # preprocess contract, not optional diagnostics: without
+        # ``_omni_is_prefill=False`` an established Talker decode row is
+        # interpreted as a first/prefill call and rebuilds its audio state.
+        req_state = self.requests.get(step.req_id)
+        if req_state is None:
+            raise RuntimeError(
+                "MiniCPM-o C1 fast preprocess lost its request state"
+            )
+        prompt_token_ids = getattr(req_state, "prompt_token_ids", ())
+        prompt_len = len(prompt_token_ids or ())
+        info["request_id"] = step.req_id
+        info["duplex_token_offset"] = step.position
+        info["duplex_prompt_len"] = prompt_len
+        info["_omni_prompt_len"] = prompt_len
+        info["_omni_num_computed_tokens"] = step.position
+        info["_omni_is_prefill"] = False
+        if self._codec_embed_graph_enabled:
+            # Keep the same tensor/tensor model-call signature used by
+            # startup FULL_DECODE capture.  The model-owned selector
+            # makes the graph consume ``input_ids`` and ignore this stale
+            # embedding row only for the strict C=1 codec lane.
+            if not callable(set_codec_embed_active):
+                raise RuntimeError(
+                    "MiniCPM-o codec-embedding graph lost its model selector"
+                )
+            set_codec_embed_active(True)
+            self._omni_num_scheduled_tokens_np = self._c1_fast_one_np
+            self._codec_embed_graph_hits += 1
+            if (
+                self._codec_embed_graph_hits == 1
+                or self._codec_embed_graph_hits % 512 == 0
+            ):
+                logger.info(
+                    "MINICPMO45_STAGE1_CODEC_EMBED_GRAPH event=use hits=%d "
+                    "request_id=%s position=%d signature=tensor_tensor "
+                    "input_ids_ptr=%d inputs_embeds_ptr=%d",
+                    self._codec_embed_graph_hits,
+                    step.req_id,
+                    step.position,
+                    int(self.input_ids.gpu.data_ptr()),
+                    int(self.inputs_embeds.gpu.data_ptr()),
+                )
+            return (
+                self.input_ids.gpu[:1],
+                self.inputs_embeds.gpu[:1],
+                self.positions[:1],
+                None,
+                self._init_model_kwargs(),
+                None,
+            )
+
+        out = self.inputs_embeds.gpu[:1]
+        preprocess_into = getattr(self.model, "preprocess_c1_decode_into", None)
+        used_host_fast = bool(
+            self._c1_host_fast_enabled
+            and callable(preprocess_into)
+            and preprocess_into(info, out)
+        )
+        if used_host_fast:
+            req_input_ids = self.input_ids.gpu[:1]
+            self._c1_host_fast_info = info
+            self._c1_host_fast_preprocess_hits += 1
+            if (
+                self._c1_host_fast_preprocess_hits == 1
+                or self._c1_host_fast_preprocess_hits % 512 == 0
+            ):
+                logger.info(
+                    "MINICPMO45_STAGE1_C1_HOST_FAST event=preprocess "
+                    "hits=%d request_id=%s position=%d",
+                    self._c1_host_fast_preprocess_hits,
+                    step.req_id,
+                    step.position,
+                )
+        else:
+            req_input_ids, req_embeds, update_dict = preprocess(
+                input_ids=self.input_ids.gpu[:1],
+                input_embeds=None,
+                **info,
+            )
+            if update_dict:
+                raise RuntimeError(
+                    "MiniCPM-o C1 decode unexpectedly produced intermediate updates: "
+                    f"{tuple(sorted(update_dict))}"
+                )
+            out.copy_(req_embeds)
+
+        self._omni_num_scheduled_tokens_np = self._c1_fast_one_np
+        return (
+            req_input_ids,
+            out,
+            self.positions[:1],
+            None,
+            self._init_model_kwargs(),
+            None,
+        )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -164,6 +1366,69 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # Use the context manager to temporarily disable pinning if needed
         with maybe_disable_pin_memory_for_ray(self, total_bytes):
             return super()._make_buffer(*size, dtype=dtype, numpy=numpy)
+
+    @_stage1_host_ledger("build_model_kwargs")
+    def _build_model_kwargs_extra(self) -> dict:
+        info = self._c1_host_fast_info
+        if self._c1_host_fast_enabled and info is not None:
+            req_id = self.input_batch.req_ids[0]
+            req_state = self.requests.get(req_id)
+            if req_state is None or self.model_intermediate_buffer.get(req_id) is not info:
+                raise RuntimeError(
+                    "MiniCPM-o C1 host fast kwargs lost its request metadata"
+                )
+            info["generated_len"] = len(req_state.output_token_ids)
+            self._c1_host_fast_infos[0] = info
+            self._c1_host_fast_kwargs_hits += 1
+            if (
+                self._c1_host_fast_kwargs_hits == 1
+                or self._c1_host_fast_kwargs_hits % 512 == 0
+            ):
+                logger.info(
+                    "MINICPMO45_STAGE1_C1_HOST_FAST event=model_kwargs "
+                    "hits=%d request_id=%s",
+                    self._c1_host_fast_kwargs_hits,
+                    req_id,
+                )
+            return {
+                "model_intermediate_buffer": self._c1_host_fast_infos,
+                "runtime_additional_information": self._c1_host_fast_infos,
+                "request_token_spans": self._c1_host_fast_spans,
+                "request_sample_eligible": self._c1_host_fast_sample_eligible,
+                "defer_codec_commit": False,
+            }
+        model_kwargs_extra = super()._build_model_kwargs_extra()
+        # K=1 MiniCPM Talker fast path: postpone only the request-visible codec
+        # commit until _bookkeeping_sync has performed the normal sampled-token
+        # D2H.  Keep every less constrained mode on the established immediate
+        # path: async scheduling has no CPU tokens here, speculative decoding
+        # can return multiple tokens, prefix caching consumes multimodal output
+        # before bookkeeping, and discarded rows intentionally do not have a
+        # valid runner sample to commit against.
+        can_defer_codec_commit = (
+            getattr(self.model, "model_stage", None) == "tts"
+            and callable(getattr(self.model, "finalize_deferred_codec_output", None))
+            and not self.use_async_scheduling
+            and self.speculative_config is None
+            and self.omni_prefix_cache is None
+            and int(getattr(self, "num_discarded_requests", 0)) == 0
+            and not getattr(self.vllm_config.model_config, "logits_processors", None)
+            and get_pp_group().world_size == 1
+        )
+        can_defer_request = False
+        if can_defer_codec_commit and int(getattr(self.input_batch, "num_reqs", 0)) == 1:
+            req_id = self.input_batch.req_ids[0]
+            req_state = self.requests.get(req_id)
+            sampling_params = getattr(req_state, "sampling_params", None)
+            model_eligibility = getattr(self.model, "can_defer_codec_commit", None)
+            can_defer_request = bool(
+                callable(model_eligibility)
+                and model_eligibility(req_id, sampling_params)
+            )
+        model_kwargs_extra["defer_codec_commit"] = (
+            can_defer_codec_commit and can_defer_request
+        )
+        return model_kwargs_extra
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def capture_model(self) -> int:
@@ -369,6 +1634,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     #  -------------------------------------- Omni-new -------------------------------------------------
 
     @torch.inference_mode()
+    @_stage1_host_ledger("execute_model")
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -886,7 +2152,32 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                can_skip_history = getattr(
+                    self.model,
+                    "can_skip_model_sampler_output_token_history",
+                    None,
+                )
+                skip_history = bool(
+                    self._c1_host_fast_enabled
+                    and callable(can_skip_history)
+                    and can_skip_history(sampling_metadata)
+                )
+                if skip_history:
+                    prepared_sampling_metadata = sampling_metadata
+                    self._c1_host_fast_sampler_history_skips += 1
+                    if (
+                        self._c1_host_fast_sampler_history_skips == 1
+                        or self._c1_host_fast_sampler_history_skips % 512 == 0
+                    ):
+                        logger.info(
+                            "MINICPMO45_STAGE1_C1_HOST_FAST event=sampler_history "
+                            "skips=%d",
+                            self._c1_host_fast_sampler_history_skips,
+                        )
+                else:
+                    prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(
+                        sampling_metadata
+                    )
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
@@ -899,6 +2190,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         return super()._sample(logits, spec_decode_metadata)
 
     @torch.inference_mode()
+    @_stage1_host_ledger("sample_tokens")
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -1026,6 +2318,20 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+
+        finalize_deferred_codec_output = getattr(
+            self.model,
+            "finalize_deferred_codec_output",
+            None,
+        )
+        if (
+            getattr(self.model, "model_stage", None) == "tts"
+            and callable(finalize_deferred_codec_output)
+        ):
+            multimodal_outputs = finalize_deferred_codec_output(
+                multimodal_outputs,
+                valid_sampled_token_ids,
+            )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
