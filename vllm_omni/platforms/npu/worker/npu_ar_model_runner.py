@@ -27,6 +27,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
+    SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -101,6 +102,55 @@ _MINICPMO45_C1_EXECUTION_PLAN_ENV = (
     "VLLM_OMNI_MINICPMO45_STAGE1_C1_EXECUTION_PLAN"
 )
 _MINICPMO45_CODEC_EMBED_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_EMBED_GRAPH"
+_MINICPMO45_KNOWN_CONTROLLER_BYPASS_ENV = (
+    "VLLM_OMNI_MINICPMO45_STAGE1_KNOWN_CONTROLLER_BYPASS"
+)
+
+
+class _AlreadyReadyEvent:
+    """Event-compatible marker for host data requiring no device copy."""
+
+    @staticmethod
+    def synchronize() -> None:
+        return None
+
+
+_ALREADY_READY_EVENT = _AlreadyReadyEvent()
+_KNOWN_CONTROLLER_CPU_TOKENS = {
+    token: torch.tensor([[token]], dtype=torch.int32) for token in (0, 1)
+}
+
+
+class _KnownControllerAsyncModelRunnerOutput(AsyncModelRunnerOutput):
+    """Async-shaped output for a controller token already known on host."""
+
+    def __init__(
+        self,
+        model_runner_output: OmniModelRunnerOutput,
+        token: int,
+        invalid_req_indices: list[int],
+    ) -> None:
+        if token not in (0, 1):
+            raise ValueError(f"Known controller token must be binary, got {token}")
+        if len(model_runner_output.req_ids) != 1:
+            raise ValueError("Known controller output requires exactly one request")
+        self._model_runner_output = model_runner_output
+        self._token = token
+        self._invalid_req_indices = tuple(invalid_req_indices)
+        self._consumed = False
+        self.sampled_token_ids_cpu = _KNOWN_CONTROLLER_CPU_TOKENS[token]
+        self.async_copy_ready_event = _ALREADY_READY_EVENT
+
+    def get_output(self) -> OmniModelRunnerOutput:
+        if self._consumed:
+            raise RuntimeError("Known controller async output was consumed twice")
+        self._consumed = True
+        sampled_token_ids = [[self._token]]
+        for index in self._invalid_req_indices:
+            sampled_token_ids[index].clear()
+        self._model_runner_output.sampled_token_ids = sampled_token_ids
+        self._model_runner_output.logprobs = None
+        return self._model_runner_output
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +384,19 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._c1_host_fast_preprocess_hits = 0
         self._c1_host_fast_kwargs_hits = 0
         self._c1_host_fast_sampler_history_skips = 0
+        self._known_controller_bypass_enabled = bool(
+            _parse_bool_env(
+                _MINICPMO45_KNOWN_CONTROLLER_BYPASS_ENV,
+                default=False,
+            )
+            and getattr(self.model_config, "model_stage", None) == "tts"
+            and str(getattr(hf_config, "version", "")) == "4.5"
+        )
+        self._known_controller_device_tokens: dict[
+            tuple[int, torch.device], torch.Tensor
+        ] = {}
+        self._known_controller_token_for_output: int | None = None
+        self._known_controller_bypass_hits = 0
         self._codec_embed_graph_enabled = bool(
             _parse_bool_env(
                 _MINICPMO45_CODEC_EMBED_GRAPH_ENV, default=True
@@ -1369,6 +1432,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     @_stage1_host_ledger("build_model_kwargs")
     def _build_model_kwargs_extra(self) -> dict:
+        known_controller_bypass = self._can_use_known_controller_bypass()
         info = self._c1_host_fast_info
         if self._c1_host_fast_enabled and info is not None:
             req_id = self.input_batch.req_ids[0]
@@ -1396,8 +1460,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 "request_token_spans": self._c1_host_fast_spans,
                 "request_sample_eligible": self._c1_host_fast_sample_eligible,
                 "defer_codec_commit": False,
+                "known_controller_bypass": known_controller_bypass,
             }
         model_kwargs_extra = super()._build_model_kwargs_extra()
+        model_kwargs_extra["known_controller_bypass"] = known_controller_bypass
         # K=1 MiniCPM Talker fast path: postpone only the request-visible codec
         # commit until _bookkeeping_sync has performed the normal sampled-token
         # D2H.  Keep every less constrained mode on the established immediate
@@ -1429,6 +1495,42 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             can_defer_codec_commit and can_defer_request
         )
         return model_kwargs_extra
+
+    def _can_use_known_controller_bypass(self) -> bool:
+        """Gate the exact C=1 async non-speculative controller sideband."""
+
+        return bool(
+            self._known_controller_bypass_enabled
+            and self.use_async_scheduling
+            and getattr(self.model, "model_stage", None) == "tts"
+            and int(getattr(self.input_batch, "num_reqs", 0)) == 1
+            and self.speculative_config is None
+            and self.omni_prefix_cache is None
+            and int(getattr(self, "num_discarded_requests", 0)) == 0
+            and not getattr(
+                self.vllm_config.model_config,
+                "logits_processors",
+                None,
+            )
+            and get_pp_group().world_size == 1
+        )
+
+    def _known_controller_sampler_output(
+        self,
+        logits: torch.Tensor,
+        token: int,
+    ) -> SamplerOutput:
+        key = (token, logits.device)
+        sampled = self._known_controller_device_tokens.get(key)
+        if sampled is None:
+            sampled = torch.full(
+                (1, 1),
+                token,
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            self._known_controller_device_tokens[key] = sampled
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def capture_model(self) -> int:
@@ -2137,10 +2239,43 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
     ):
+        self._known_controller_token_for_output = None
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
+            take_known_controller = getattr(
+                self.model,
+                "take_known_controller_token",
+                None,
+            )
+            if (
+                logits is not None
+                and self._can_use_known_controller_bypass()
+                and callable(take_known_controller)
+            ):
+                req_id = self.input_batch.req_ids[0]
+                req_state = self.requests.get(req_id)
+                sampling_params = getattr(req_state, "sampling_params", None)
+                known_token = take_known_controller(req_id, sampling_params)
+                if known_token is not None:
+                    self._known_controller_token_for_output = int(known_token)
+                    self._known_controller_bypass_hits += 1
+                    if (
+                        self._known_controller_bypass_hits == 1
+                        or self._known_controller_bypass_hits % 512 == 0
+                    ):
+                        logger.info(
+                            "MINICPMO45_KNOWN_CONTROLLER event=bypass "
+                            "hits=%d request_id=%s token=%d",
+                            self._known_controller_bypass_hits,
+                            req_id,
+                            known_token,
+                        )
+                    return self._known_controller_sampler_output(
+                        logits,
+                        int(known_token),
+                    )
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
@@ -2276,6 +2411,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        known_controller_token = self._known_controller_token_for_output
+        self._known_controller_token_for_output = None
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2582,6 +2719,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         if not self.use_async_scheduling:
             return model_runner_output
+        if known_controller_token is not None:
+            if sampler_output.logprobs_tensors is not None:
+                raise RuntimeError(
+                    "Known controller bypass cannot return logprobs"
+                )
+            async_output = _KnownControllerAsyncModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                token=known_controller_token,
+                invalid_req_indices=invalid_req_indices,
+            )
+            self.input_batch.set_async_sampled_token_ids(
+                async_output.sampled_token_ids_cpu,
+                async_output.async_copy_ready_event,
+            )
+            return async_output
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,

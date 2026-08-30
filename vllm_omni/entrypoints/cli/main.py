@@ -175,6 +175,10 @@ def _maybe_prepare_minicpmo45_npu_runtime() -> None:
         "25",
     )
     os.environ.setdefault(
+        "VLLM_OMNI_MINICPMO45_STAGE1_KNOWN_CONTROLLER_BYPASS",
+        "1",
+    )
+    os.environ.setdefault(
         "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",
         "1",
     )

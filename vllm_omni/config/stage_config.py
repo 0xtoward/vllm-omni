@@ -1016,6 +1016,18 @@ def _apply_minicpmo_4_5_npu_graph_defaults(
     if platform != "npu":
         return
 
+    # The official job grants one exclusive CPU cpuset to the whole
+    # three-stage service.  vLLM-Ascend's binder is NPU-aware but not Omni
+    # stage-aware: three same-die EngineCore processes otherwise select the
+    # same NPU0 main/ACL/release slice and leave the other logical-NPU slice
+    # unused.  Keep the inherited cpuset authoritative and let Linux schedule
+    # the three stages across it.  This changes placement only, never model
+    # math, RNG, cache ownership, or device placement.
+    for stage in deploy.stages:
+        additional = dict(stage.engine_extras.get("additional_config") or {})
+        additional["enable_cpu_binding"] = False
+        stage.engine_extras["additional_config"] = additional
+
     # The challenge contract is strict single-concurrency.  Serialize any
     # accuracy-suite burst internally and use the second logical die only for
     # Code2Wav, leaving Thinker and Talker on die 0.  An explicit opt-out keeps

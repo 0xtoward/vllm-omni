@@ -103,6 +103,22 @@ class _DeferredCodecBatch:
     sparse_output: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _KnownControllerHint:
+    """One normally committed nonterminal step with a known runner token.
+
+    Codec sampling, RNG advance, repetition history, sparse handoff and model
+    state all use the stock path before this sideband exists.  A terminal step
+    is never represented by the hint and therefore always uses stock sampling,
+    D2H, finish ownership and cleanup.
+    """
+
+    request_id: str
+    step_before: int
+    step_after: int
+    token: int
+
+
 def _max_audio_tokens(condition_tokens: int) -> int:
     """Bound codec generation with a conservative text-length estimate.
 
@@ -278,6 +294,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_codec_batch: _DeferredCodecBatch | None = None
         self._deferred_codec_commit_total = 0
         self._deferred_codec_reject_reasons_logged: set[str] = set()
+        self._known_controller_hint: _KnownControllerHint | None = None
+        self._known_controller_hint_hits = 0
         npu_default = "1" if current_omni_platform.is_npu() else "0"
         self._codec_sampler_graph_enabled = os.environ.get(
             "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_SAMPLER_NPUGRAPH", npu_default
@@ -670,6 +688,80 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         ):
             return reject("request_constraints")
         return True
+
+    def take_known_controller_token(
+        self,
+        request_id: str,
+        sampling_params: Any,
+    ) -> int | None:
+        """Consume one committed nonterminal hint after exact revalidation.
+
+        Clear-before-check makes the hint one-shot even when validation fails
+        or the request is aborted.  Request identity and the committed state
+        step must both match; no codec tensor or RNG state is changed here.
+        """
+
+        hint = self._known_controller_hint
+        self._known_controller_hint = None
+        if hint is None or hint.request_id != str(request_id):
+            return None
+        state = self._request_audio_states.get(hint.request_id)
+        if not isinstance(state, dict) or state.get("finished"):
+            return None
+        if int(state.get("step", -1)) != hint.step_after:
+            return None
+        if hint.step_after != hint.step_before + 1 or hint.token != 0:
+            return None
+
+        # This bypass returns no logprobs and does not apply client-side logit
+        # processors.  Require absence, rather than truthiness, so values such
+        # as logprobs=0 cannot silently enter the fast lane.
+        if sampling_params is None:
+            return None
+        try:
+            raw_stop_ids = {
+                int(token_id)
+                for token_id in sampling_params.all_stop_token_ids
+            }
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if raw_stop_ids != {1}:
+            return None
+        # vLLM materializes the default ``bad_words`` as ``[]``.
+        # The empty list is a no-op, while every real request processor stays
+        # fail-closed on the stock sampler path.
+        if (
+            any(
+                getattr(sampling_params, name, None) is not None
+                for name in (
+                    "allowed_token_ids",
+                    "logit_bias",
+                    "structured_outputs",
+                    "logprobs",
+                    "prompt_logprobs",
+                )
+            )
+            or bool(getattr(sampling_params, "bad_words", None))
+            or bool(getattr(sampling_params, "ignore_eos", False))
+        ):
+            return None
+        if not self.can_defer_codec_commit(hint.request_id, sampling_params):
+            return None
+
+        self._known_controller_hint_hits += 1
+        if (
+            self._known_controller_hint_hits == 1
+            or self._known_controller_hint_hits % 512 == 0
+        ):
+            logger.info(
+                "MINICPMO45_KNOWN_CONTROLLER event=consume hits=%d "
+                "request_id=%s step=%d token=%d",
+                self._known_controller_hint_hits,
+                hint.request_id,
+                hint.step_before,
+                hint.token,
+            )
+        return hint.token
 
     def _codec_sampler_probabilities(
         self,
@@ -1237,6 +1329,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         model_outputs: torch.Tensor | OmniOutput,
         **kwargs: Any,
     ) -> OmniOutput:
+        # A hint belongs to exactly one forward/sample pair.  Clear before
+        # passthrough, invalid rows and every normal forward so a stale hint
+        # cannot be consumed by another request or step.
+        self._known_controller_hint = None
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         hidden = model_outputs
@@ -1264,6 +1360,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # hook.  It therefore cannot reuse the ordinary runner stop token as
         # the codec EOS decision; retain the immediate commit path.
         defer_codec_commit = bool(kwargs.get("defer_codec_commit", False)) and not emit_duplex_metadata
+        known_controller_bypass = bool(
+            kwargs.get("known_controller_bypass", False)
+        ) and not emit_duplex_metadata
         if defer_codec_commit and self._deferred_codec_batch is not None:
             raise RuntimeError("MiniCPM-o Talker has an unconsumed deferred codec batch")
         deferred_entries: list[_DeferredCodecEntry] = []
@@ -1411,6 +1510,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 sparse_req_ids.append(request_id)
                 sparse_codec_deltas.append(sparse_delta)
                 sparse_terminal_flags.append(terminal)
+            if known_controller_bypass and len(infos) == 1 and not commit.finished:
+                # The stock commit is authoritative.  Every nonterminal row
+                # maps to controller token 0 both before and after min_tokens;
+                # terminal remains on the stock sampler and D2H path.
+                self._known_controller_hint = _KnownControllerHint(
+                    request_id=request_id,
+                    step_before=proposal.step_before,
+                    step_after=proposal.step_before + 1,
+                    token=0,
+                )
             stop_rows.append(self._cached_stop_row(hidden, finished=commit.finished))
 
         if len(stop_rows) == 1:
@@ -1465,6 +1574,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         finished_ids = {str(req_id) for req_id in finished_req_ids}
+        hint = self._known_controller_hint
+        if hint is not None and hint.request_id in finished_ids:
+            self._known_controller_hint = None
         pending = self._deferred_codec_batch
         if pending is not None and any(
             entry.proposal.request_id in finished_ids for entry in pending.entries

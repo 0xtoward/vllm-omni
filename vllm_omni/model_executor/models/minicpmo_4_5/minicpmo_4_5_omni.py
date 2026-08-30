@@ -330,6 +330,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
         )
 
+    def take_known_controller_token(
+        self,
+        request_id: str,
+        sampling_params: Any,
+    ) -> int | None:
+        """Delegate the Talker's one-shot exact controller hint to the runner."""
+
+        if self.model_stage != "tts" or self.talker is None:
+            return None
+        take = getattr(self.talker, "take_known_controller_token", None)
+        if not callable(take):
+            return None
+        return take(request_id, sampling_params)
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
