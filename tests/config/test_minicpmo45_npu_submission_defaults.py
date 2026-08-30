@@ -47,6 +47,10 @@ def test_minicpmo45_npu_serve_limits_parent_before_native_binding(monkeypatch):
         "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",
         raising=False,
     )
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_STAGE1_FIA_FIXED192",
+        raising=False,
+    )
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setattr(
         sys,
@@ -85,6 +89,7 @@ def test_minicpmo45_npu_serve_limits_parent_before_native_binding(monkeypatch):
     assert os.environ["_MINICPMO45_NUMA_INHERITED_CPUSET"] == "0-31"
     assert os.environ["_MINICPMO45_NUMA_EFFECTIVE_CPUSET"] == "0-15"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES"] == "25"
+    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_FIA_FIXED192"] == "1"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM"] == "1"
 
 
