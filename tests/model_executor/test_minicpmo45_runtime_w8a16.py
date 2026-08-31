@@ -35,6 +35,7 @@ def test_description_quantizes_only_thinker_linear_weights(tmp_path):
 
 
 def test_overlay_keeps_weights_external_and_injects_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_STAGE0_RUNTIME_W8A16", "1")
     model = _fake_model(tmp_path)
     overlay_root = tmp_path / "overlays"
     overlay_root.mkdir()
@@ -46,3 +47,9 @@ def test_overlay_keeps_weights_external_and_injects_config(tmp_path, monkeypatch
     assert config["quantization_config"][
         "llm.model.layers.0.mlp.down_proj.weight"
     ] == "W8A16_RUNTIME"
+
+
+def test_overlay_is_opt_in_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_STAGE0_RUNTIME_W8A16", raising=False)
+    model = _fake_model(tmp_path)
+    assert Path(prepare_model_overlay(model)) == model

@@ -260,7 +260,7 @@ def _maybe_prepare_minicpmo45_npu_runtime() -> None:
     )
     os.environ.setdefault(
         "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K",
-        "4",
+        "8",
     )
     os.environ.setdefault(
         "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",

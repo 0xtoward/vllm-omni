@@ -63,7 +63,7 @@ def prepare_model_overlay(model_dir: str | os.PathLike[str]) -> str:
     explicit opt-out are returned unchanged.
     """
     source = Path(model_dir).resolve()
-    if os.environ.get("VLLM_OMNI_MINICPMO45_STAGE0_RUNTIME_W8A16", "1") == "0":
+    if os.environ.get("VLLM_OMNI_MINICPMO45_STAGE0_RUNTIME_W8A16", "0") == "0":
         return str(source)
     config_path = source / "config.json"
     index_path = source / "model.safetensors.index.json"

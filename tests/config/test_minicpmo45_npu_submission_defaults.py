@@ -154,7 +154,7 @@ def test_minicpmo45_npu_serve_limits_parent_before_native_binding(monkeypatch):
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES"] == "25"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_FIA_FIXED192"] == "1"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_FIA_PREFIX_BARRIER_GATE0"] == "1"
-    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K"] == "4"
+    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K"] == "8"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM"] == "1"
 
 
@@ -195,7 +195,7 @@ def test_minicpmo45_runtime_preparation_is_idempotent(monkeypatch):
     assert affinity == set(range(32))
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_FIA_FIXED192"] == "1"
     assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_FIA_PREFIX_BARRIER_GATE0"] == "1"
-    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K"] == "4"
+    assert os.environ["VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K"] == "8"
 
 
 def test_minicpmo45_numa_fails_open_if_kernel_does_not_apply_requested_mask(
