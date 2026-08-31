@@ -145,6 +145,10 @@ class _CodecEosBatch:
     proposals: list[_CodecProposal]
 
 
+_CODEC_EOS_BATCH_K_VALUES = (0, 2, 4, 8)
+_MAX_CODEC_EOS_BATCH_K = max(_CODEC_EOS_BATCH_K_VALUES)
+
+
 def _max_audio_tokens(condition_tokens: int) -> int:
     """Bound codec generation with a conservative text-length estimate.
 
@@ -330,24 +334,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_eos_batch_k = int(raw_eos_batch_k)
         except ValueError:
             raise ValueError(
-                "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K must be 0, 2, or 4"
+                "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K must be 0, 2, 4, or 8"
             ) from None
-        if self._codec_eos_batch_k not in (0, 2, 4):
+        if self._codec_eos_batch_k not in _CODEC_EOS_BATCH_K_VALUES:
             raise ValueError(
-                "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K must be 0, 2, or 4"
+                "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K must be 0, 2, 4, or 8"
             )
         self._codec_eos_batch: _CodecEosBatch | None = None
         self._codec_eos_batch_steps = 0
         self._codec_eos_batch_boundaries = 0
         self._codec_eos_batch_no_eos = 0
-        self._codec_eos_batch_terminal_rows = [0, 0, 0, 0]
+        self._codec_eos_batch_terminal_rows = [0] * _MAX_CODEC_EOS_BATCH_K
         self._codec_eos_batch_rollbacks = 0
         self._codec_eos_batch_rolled_back_rows = 0
         self._codec_eos_batch_wasted_suffix_rows = 0
         self._codec_eos_batch_aborts = 0
         self.register_buffer(
             "_codec_eos_batch_samples",
-            torch.full((4,), -1, dtype=torch.long),
+            torch.full((_MAX_CODEC_EOS_BATCH_K,), -1, dtype=torch.long),
             persistent=False,
         )
         npu_default = "1" if current_omni_platform.is_npu() else "0"
@@ -1402,16 +1406,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         k = self._codec_eos_batch_k
         if (
-            k not in (2, 4)
+            k not in (2, 4, 8)
             or self._codec_eos_batch is not None
             or not sparse_output
             or not known_controller_bypass
             or proposal.step_before < proposal.min_tokens
             or proposal.step_before + k >= proposal.max_tokens
-            # K=4 is deliberately competition-only and validated against the
-            # real Stage1 sparse handoff contract.  Stage2 CCF50 is a separate
-            # aggregation boundary; the Talker itself publishes every 25 rows.
-            or (k == 4 and self._sparse_chunk_frames != 25)
+            # K>=4 is deliberately competition-only and must stay inside the
+            # real 25-row Stage1 sparse handoff contract. Stage2 CCF50 is a
+            # separate aggregation boundary; the Talker publishes every 25.
+            or (k >= 4 and self._sparse_chunk_frames != 25)
         ):
             return False
         pending = state.get("sparse_pending_codec_deltas")
