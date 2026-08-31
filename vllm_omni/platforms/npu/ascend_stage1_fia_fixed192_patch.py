@@ -204,7 +204,7 @@ def _observe(
     if len(live_lengths) != 1:
         return Observation(False, None, "layer_length_mismatch"), [], None
     live_len = live_lengths.pop()
-    reason = "eligible" if 1 <= live_len <= FIXED_CAPACITY else "length_gt_192"
+    reason = "eligible" if 1 <= live_len <= FIXED_CAPACITY else "length_gt_256"
     return Observation(True, live_len, reason), unique, source_table
 
 

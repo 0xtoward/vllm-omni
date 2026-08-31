@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 BLOCK_SIZE = 128
-FIXED_CAPACITY = 192
+FIXED_CAPACITY = 256
 MASK_WIDTH = 256
 
 
