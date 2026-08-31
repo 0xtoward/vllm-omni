@@ -613,6 +613,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 min_tokens = self._codec_min_tokens
             state = {
                 "step": 0,
+                # Monotonic request-local commit generation used by the EOS
+                # K-batch rollback contract. Every optimistic row advances
+                # this counter exactly once.
+                "history_version": 0,
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
                 "finished": empty_condition,
@@ -1330,6 +1334,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
 
         state["step"] = commit.step_after
+        state["history_version"] = int(state.get("history_version", 0)) + 1
         state["finished"] = commit.finished
         state["codes"] = commit.codes_after
         info["audio_state"] = state
