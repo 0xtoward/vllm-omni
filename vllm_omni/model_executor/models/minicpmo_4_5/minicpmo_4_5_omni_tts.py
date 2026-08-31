@@ -119,6 +119,29 @@ class _KnownControllerHint:
     token: int
 
 
+@dataclass(slots=True)
+class _CodecEosBatch:
+    """One private K-row EOS-resolution transaction.
+
+    The first K-1 codec rows are committed optimistically as nonterminal so the
+    next ordinary q_len=1 forward can consume them.  Nothing is sent to Stage2
+    while the transaction is open.  At row K-1 one D2H resolves all sampled
+    tokens; an early EOS rolls back only the private suffix starting at that
+    EOS before publishing the terminal payload.
+    """
+
+    k: int
+    request_id: str
+    step_before: int
+    history_version_before: int
+    sparse_pending_len_before: int
+    sparse_suppressed_before: int
+    sparse_suppressed_total_before: int
+    codes_before: torch.Tensor
+    current_code_before: torch.Tensor
+    proposals: list[_CodecProposal]
+
+
 def _max_audio_tokens(condition_tokens: int) -> int:
     """Bound codec generation with a conservative text-length estimate.
 
@@ -296,6 +319,34 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_codec_reject_reasons_logged: set[str] = set()
         self._known_controller_hint: _KnownControllerHint | None = None
         self._known_controller_hint_hits = 0
+        raw_eos_batch_k = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K",
+            "0",
+        )
+        try:
+            self._codec_eos_batch_k = int(raw_eos_batch_k)
+        except ValueError:
+            raise ValueError(
+                "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K must be 0, 2, or 4"
+            ) from None
+        if self._codec_eos_batch_k not in (0, 2, 4):
+            raise ValueError(
+                "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K must be 0, 2, or 4"
+            )
+        self._codec_eos_batch: _CodecEosBatch | None = None
+        self._codec_eos_batch_steps = 0
+        self._codec_eos_batch_boundaries = 0
+        self._codec_eos_batch_no_eos = 0
+        self._codec_eos_batch_terminal_rows = [0, 0, 0, 0]
+        self._codec_eos_batch_rollbacks = 0
+        self._codec_eos_batch_rolled_back_rows = 0
+        self._codec_eos_batch_wasted_suffix_rows = 0
+        self._codec_eos_batch_aborts = 0
+        self.register_buffer(
+            "_codec_eos_batch_samples",
+            torch.full((4,), -1, dtype=torch.long),
+            persistent=False,
+        )
         npu_default = "1" if current_omni_platform.is_npu() else "0"
         self._codec_sampler_graph_enabled = os.environ.get(
             "VLLM_OMNI_MINICPMO45_STAGE1_CODEC_SAMPLER_NPUGRAPH", npu_default
@@ -326,6 +377,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             logger.info("MINICPMO45_CODEC_GREEDY event=enabled")
         if self._codec_embed_graph_enabled:
             logger.info("MINICPMO45_STAGE1_CODEC_EMBED_GRAPH event=enabled")
+        if self._codec_eos_batch_k:
+            logger.warning(
+                "MINICPMO45_STAGE1_EOS_BATCH event=enabled k=%d "
+                "judge_default=true explicit_opt_out=0",
+                self._codec_eos_batch_k,
+            )
         raw_sparse_chunk = os.environ.get(
             "VLLM_OMNI_MINICPMO45_STAGE1_SPARSE_CHUNK_FRAMES",
             "0",
@@ -1324,6 +1381,290 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             pending.clear()
         return result_delta, commit.terminal, sparse_delta
 
+    def _can_start_codec_eos_batch(
+        self,
+        *,
+        proposal: _CodecProposal,
+        state: dict[str, Any],
+        sparse_output: bool,
+        known_controller_bypass: bool,
+    ) -> bool:
+        """Fail-closed gate for a K-row delayed-EOS transaction."""
+
+        k = self._codec_eos_batch_k
+        if (
+            k not in (2, 4)
+            or self._codec_eos_batch is not None
+            or not sparse_output
+            or not known_controller_bypass
+            or proposal.step_before < proposal.min_tokens
+            or proposal.step_before + k >= proposal.max_tokens
+            # K=4 is deliberately competition-only and validated against the
+            # real Stage1 sparse handoff contract.  Stage2 CCF50 is a separate
+            # aggregation boundary; the Talker itself publishes every 25 rows.
+            or (k == 4 and self._sparse_chunk_frames != 25)
+        ):
+            return False
+        pending = state.get("sparse_pending_codec_deltas")
+        if pending is None:
+            pending_len = 0
+        elif isinstance(pending, list):
+            pending_len = len(pending)
+        else:
+            return False
+        # No row may publish a payload before the joint EOS decision.
+        return pending_len + k < self._sparse_chunk_frames
+
+    def _rollback_codec_eos_batch_suffix(
+        self,
+        *,
+        batch: _CodecEosBatch,
+        first_eos: int,
+        info: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        """Undo optimistic rows starting at the first EOS.
+
+        Rows before ``first_eos`` remain accepted.  Their request-visible
+        history already exists in ``batch.proposals[first_eos].codes_before``;
+        retaining it avoids replaying Python commits or duplicating sparse
+        telemetry.
+        """
+
+        optimistic_rows = batch.k - 1
+        if not 0 <= first_eos < optimistic_rows:
+            raise RuntimeError("MiniCPM-o EOS batch rollback index is invalid")
+        if (
+            int(state.get("step", -1)) != batch.step_before + optimistic_rows
+            or int(state.get("history_version", -1))
+            != batch.history_version_before + optimistic_rows
+            or int(state.get("sparse_suppressed", -1))
+            != batch.sparse_suppressed_before + optimistic_rows
+            or self._sparse_suppressed_total
+            != batch.sparse_suppressed_total_before + optimistic_rows
+            or state.get("finished")
+        ):
+            raise RuntimeError(
+                "MiniCPM-o EOS batch lost its optimistic private state"
+            )
+        pending = state.get("sparse_pending_codec_deltas")
+        if not isinstance(pending, list) or len(pending) != (
+            batch.sparse_pending_len_before + optimistic_rows
+        ):
+            raise RuntimeError(
+                "MiniCPM-o EOS batch lost its private sparse payload"
+            )
+        del pending[batch.sparse_pending_len_before + first_eos :]
+        if first_eos == 0:
+            codes = batch.codes_before
+            current = batch.current_code_before
+        else:
+            codes = batch.proposals[first_eos].codes_before
+            if codes.numel() == 0:
+                raise RuntimeError(
+                    "MiniCPM-o EOS batch accepted prefix lost its current code"
+                )
+            current = codes[-1:]
+        state["step"] = batch.step_before + first_eos
+        state["history_version"] = batch.history_version_before + first_eos
+        state["finished"] = False
+        state["codes"] = codes
+        state["sparse_suppressed"] = (
+            batch.sparse_suppressed_before + first_eos
+        )
+        self._sparse_suppressed_total = (
+            batch.sparse_suppressed_total_before + first_eos
+        )
+        info["audio_state"] = state
+        info["audio_codes"] = {
+            "current": current,
+            "accumulated": codes,
+        }
+
+    def _try_codec_eos_batch_step(
+        self,
+        *,
+        info: dict[str, Any],
+        state: dict[str, Any],
+        proposal: _CodecProposal,
+        sparse_output: bool,
+        known_controller_bypass: bool,
+        empty_delta: torch.Tensor,
+    ) -> tuple[_CodecCommitState, torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+        """Commit one ordinary row while resolving EOS once per K rows.
+
+        This is not a multi-token model graph: the scheduler still owns every
+        q_len=1 row and therefore every physical KV slot.  Only the scalar EOS
+        synchronization is batched.  Any contract loss after the first draw is
+        fatal; there is no retry or eager fallback inside a transaction.
+        """
+
+        batch = self._codec_eos_batch
+        if batch is None:
+            if not self._can_start_codec_eos_batch(
+                proposal=proposal,
+                state=state,
+                sparse_output=sparse_output,
+                known_controller_bypass=known_controller_bypass,
+            ):
+                return None
+            pending = state.get("sparse_pending_codec_deltas")
+            pending_len = len(pending) if isinstance(pending, list) else 0
+            current = (info.get("audio_codes", {}) or {}).get("current")
+            if not isinstance(current, torch.Tensor) or current.shape != (1,):
+                raise RuntimeError(
+                    "MiniCPM-o EOS batch requires one request-local current code"
+                )
+            batch = _CodecEosBatch(
+                k=self._codec_eos_batch_k,
+                request_id=proposal.request_id,
+                step_before=proposal.step_before,
+                history_version_before=int(state.get("history_version", 0)),
+                sparse_pending_len_before=pending_len,
+                sparse_suppressed_before=int(state.get("sparse_suppressed", 0)),
+                sparse_suppressed_total_before=self._sparse_suppressed_total,
+                codes_before=proposal.codes_before,
+                current_code_before=current,
+                proposals=[],
+            )
+            self._codec_eos_batch = batch
+        elif (
+            batch.request_id != proposal.request_id
+            or len(batch.proposals) >= batch.k
+            or proposal.step_before
+            != batch.step_before + len(batch.proposals)
+            or proposal.min_tokens != batch.proposals[0].min_tokens
+            or proposal.max_tokens != batch.proposals[0].max_tokens
+            or not sparse_output
+            or not known_controller_bypass
+        ):
+            raise RuntimeError(
+                "MiniCPM-o EOS batch transaction lost its strict C=1 continuation"
+            )
+
+        row = len(batch.proposals)
+        if not 0 <= row < batch.k:
+            raise RuntimeError("MiniCPM-o EOS batch exceeded its K boundary")
+        self._codec_eos_batch_samples[row].copy_(proposal.sampled.reshape(()))
+        batch.proposals.append(proposal)
+        self._codec_eos_batch_steps += 1
+
+        if row < batch.k - 1:
+            commit = self._resolve_codec_proposal(
+                proposal,
+                empty_delta=empty_delta,
+                runner_stop_token=0,
+            )
+            delta, terminal, sparse_delta = self._commit_codec_prefix(
+                info=info,
+                state=state,
+                commit=commit,
+                sparse_output=True,
+                empty_delta=empty_delta,
+            )
+            if commit.finished or sparse_delta is not None:
+                raise RuntimeError(
+                    "MiniCPM-o EOS batch optimistic row escaped its private boundary"
+                )
+            return commit, delta, terminal, sparse_delta
+
+        sampled = [
+            int(token)
+            for token in self._codec_eos_batch_samples[: batch.k]
+            .detach()
+            .to(device="cpu")
+            .tolist()
+        ]
+        eos_id = self._num_audio_tokens - 1
+        first_eos = next(
+            (index for index, token in enumerate(sampled) if token == eos_id),
+            None,
+        )
+        self._codec_eos_batch = None
+        self._codec_eos_batch_boundaries += 1
+
+        if first_eos is None:
+            self._codec_eos_batch_no_eos += 1
+            commit_index = batch.k - 1
+            stop_token = 0
+        else:
+            self._codec_eos_batch_terminal_rows[first_eos] += 1
+            commit_index = first_eos
+            stop_token = 1
+        if first_eos is not None and first_eos < batch.k - 1:
+            self._codec_eos_batch_rollbacks += 1
+            rolled_back = batch.k - 1 - first_eos
+            self._codec_eos_batch_rolled_back_rows += rolled_back
+            self._codec_eos_batch_wasted_suffix_rows += batch.k - first_eos - 1
+            self._rollback_codec_eos_batch_suffix(
+                batch=batch,
+                first_eos=first_eos,
+                info=info,
+                state=state,
+            )
+
+        if commit_index == batch.k - 1:
+            # Preserve the known-good K=2 lifetime contract for the final row.
+            # Its live proposal owns the codec delta that may remain queued in
+            # sparse_pending_codec_deltas across later boundaries.  Returning
+            # a view into _codec_eos_batch_samples here makes old pending rows
+            # change when that fixed buffer is reused, corrupting the audio.
+            commit_proposal = proposal
+        else:
+            base = batch.proposals[commit_index]
+            codes_before = state.get("codes")
+            if not isinstance(codes_before, torch.Tensor):
+                raise RuntimeError("MiniCPM-o EOS batch lost its commit history")
+            # An early EOS row's original graph output may have been reused by
+            # a later optimistic row.  Copy the authoritative fixed sample to
+            # request-owned storage before publishing terminal state.
+            commit_proposal = _CodecProposal(
+                request_id=base.request_id,
+                sampled=self._codec_eos_batch_samples[commit_index]
+                .reshape(())
+                .clone(),
+                step_before=base.step_before,
+                min_tokens=base.min_tokens,
+                max_tokens=base.max_tokens,
+                codes_before=codes_before,
+            )
+
+        commit = self._resolve_codec_proposal(
+            commit_proposal,
+            empty_delta=empty_delta,
+            runner_stop_token=stop_token,
+        )
+        delta, terminal, sparse_delta = self._commit_codec_prefix(
+            info=info,
+            state=state,
+            commit=commit,
+            sparse_output=True,
+            empty_delta=empty_delta,
+        )
+        if (
+            self._codec_eos_batch_boundaries == 1
+            or self._codec_eos_batch_boundaries % 512 == 0
+            or commit.finished
+        ):
+            logger.info(
+                "MINICPMO45_STAGE1_EOS_BATCH event=resolve k=%d boundaries=%d "
+                "steps=%d first_eos=%s terminal_rows=%s rollbacks=%d "
+                "rolled_back_rows=%d wasted_suffix_rows=%d request_id=%s",
+                batch.k,
+                self._codec_eos_batch_boundaries,
+                self._codec_eos_batch_steps,
+                first_eos,
+                ",".join(
+                    str(value)
+                    for value in self._codec_eos_batch_terminal_rows[: batch.k]
+                ),
+                self._codec_eos_batch_rollbacks,
+                self._codec_eos_batch_rolled_back_rows,
+                self._codec_eos_batch_wasted_suffix_rows,
+                proposal.request_id,
+            )
+        return commit, delta, terminal, sparse_delta
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -1493,17 +1834,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 stop_rows.append(self._proposal_stop_row(proposal, hidden))
                 continue
-            commit = self._resolve_codec_proposal(
-                proposal,
-                empty_delta=empty_delta,
-            )
-            delta, terminal, sparse_delta = self._commit_codec_prefix(
+            eos_batch_result = self._try_codec_eos_batch_step(
                 info=info,
                 state=state,
-                commit=commit,
+                proposal=proposal,
                 sparse_output=sparse_output,
+                known_controller_bypass=known_controller_bypass,
                 empty_delta=empty_delta,
             )
+            if eos_batch_result is None:
+                commit = self._resolve_codec_proposal(
+                    proposal,
+                    empty_delta=empty_delta,
+                )
+                delta, terminal, sparse_delta = self._commit_codec_prefix(
+                    info=info,
+                    state=state,
+                    commit=commit,
+                    sparse_output=sparse_output,
+                    empty_delta=empty_delta,
+                )
+            else:
+                commit, delta, terminal, sparse_delta = eos_batch_result
             codec_deltas.append(delta)
             terminal_flags.append(terminal)
             if sparse_output and sparse_delta is not None:
@@ -1584,6 +1936,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Abort/error cleanup must not let a proposal from an earlier turn
             # be committed by a later request's sampled controller token.
             self._deferred_codec_batch = None
+        eos_batch = self._codec_eos_batch
+        if eos_batch is not None and eos_batch.request_id in finished_ids:
+            # Abort/error owns the whole request.  No retry is legal after the
+            # first random draw, so discard the private transaction with it.
+            self._codec_eos_batch = None
+            self._codec_eos_batch_aborts += 1
+            logger.warning(
+                "MINICPMO45_STAGE1_EOS_BATCH event=abort_open k=%d "
+                "rows=%d aborts=%d request_id=%s",
+                eos_batch.k,
+                len(eos_batch.proposals),
+                self._codec_eos_batch_aborts,
+                eos_batch.request_id,
+            )
         if self._sparse_chunk_frames:
             pending_rows = sum(
                 len(state.get("sparse_pending_codec_deltas", []))

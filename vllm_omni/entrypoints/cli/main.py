@@ -5,6 +5,11 @@ CLI entry point for vLLM-Omni that intercepts vLLM commands.
 import importlib.metadata
 import sys
 
+# The official evaluator already assigns one job an exclusive 24-core cpuset.
+# Preserve small, scheduler-managed allocations even when they span NUMA nodes;
+# narrowing those again can leave the service with only a fraction of its CPUs.
+_MINICPMO45_PRESERVE_INHERITED_CPUSET_MAX = 32
+
 
 def _parse_linux_cpu_list(value: str) -> set[int]:
     cpus: set[int] = set()
@@ -41,13 +46,60 @@ def _select_local_numa_cpuset(
     node_cpus: dict[int, set[int]],
 ) -> tuple[int, set[int]] | None:
     """Choose one NUMA-local subset without escaping the inherited cpuset."""
-    candidates = {
-        node: allowed & cpus for node, cpus in node_cpus.items() if allowed & cpus
-    }
+    candidates = {node: allowed & cpus for node, cpus in node_cpus.items() if allowed & cpus}
     if not candidates:
         return None
     node = min(candidates, key=lambda item: (-len(candidates[item]), item))
     return node, candidates[node]
+
+
+def _fail_open_minicpmo45_numa(
+    reason: str,
+    inherited: set[int] | None,
+    detail: str = "",
+) -> None:
+    """Keep service startup alive when optional NUMA narrowing is unsafe.
+
+    If narrowing already changed the current process, make a best-effort
+    rollback to the inherited mask.  The vLLM-Ascend native binder can then
+    operate within the evaluator-provided cpuset as it does without this
+    MiniCPM-specific optimization.
+    """
+    import os
+
+    effective: set[int] | None = inherited
+    restore_status = "not-needed"
+    if inherited is not None:
+        try:
+            effective = set(os.sched_getaffinity(0))
+        except OSError as exc:
+            effective = None
+            restore_status = f"inspect-failed:{type(exc).__name__}"
+        else:
+            if effective != inherited:
+                try:
+                    os.sched_setaffinity(0, inherited)
+                    effective = set(os.sched_getaffinity(0))
+                except OSError as exc:
+                    restore_status = f"failed:{type(exc).__name__}"
+                else:
+                    restore_status = "restored" if effective == inherited else "mismatch"
+
+    inherited_text = _format_linux_cpu_list(inherited) if inherited is not None else "unknown"
+    effective_text = _format_linux_cpu_list(effective) if effective is not None else "unknown"
+    os.environ["_MINICPMO45_NUMA_INHERITED_CPUSET"] = inherited_text
+    os.environ["_MINICPMO45_NUMA_EFFECTIVE_CPUSET"] = effective_text
+    os.environ["_MINICPMO45_NUMA_STATUS"] = f"skipped:{reason}"
+    detail_suffix = f" detail={detail}" if detail else ""
+    print(
+        "[minicpmo45-numa] "
+        f"status=skipped reason={reason} inherited={inherited_text} "
+        f"effective={effective_text} restore={restore_status} "
+        "owner=vllm-ascend-native-binder"
+        f"{detail_suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _limit_minicpmo45_npu_to_local_cpuset() -> None:
@@ -69,65 +121,92 @@ def _limit_minicpmo45_npu_to_local_cpuset() -> None:
             flush=True,
         )
         return
-    allowed = set(os.sched_getaffinity(0))
+    try:
+        allowed = set(os.sched_getaffinity(0))
+    except OSError as exc:
+        _fail_open_minicpmo45_numa(
+            "get-affinity-failed",
+            None,
+            type(exc).__name__,
+        )
+        return
     if not allowed:
-        raise RuntimeError("MiniCPM-o NUMA setup found an empty inherited CPU set")
+        _fail_open_minicpmo45_numa("empty-inherited-cpuset", allowed)
+        return
+    if len(allowed) <= _MINICPMO45_PRESERVE_INHERITED_CPUSET_MAX:
+        allowed_text = _format_linux_cpu_list(allowed)
+        os.environ["_MINICPMO45_NUMA_AFFINITY"] = f"inherited:{len(allowed)}"
+        os.environ["_MINICPMO45_NUMA_INHERITED_CPUSET"] = allowed_text
+        os.environ["_MINICPMO45_NUMA_EFFECTIVE_CPUSET"] = allowed_text
+        os.environ["_MINICPMO45_NUMA_STATUS"] = "preserved:small-cpuset"
+        print(
+            "[minicpmo45-numa] status=preserved reason=small-cpuset "
+            f"inherited={allowed_text} effective={allowed_text} "
+            f"threshold={_MINICPMO45_PRESERVE_INHERITED_CPUSET_MAX} "
+            "owner=vllm-ascend-native-binder",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     node_cpus: dict[int, set[int]] = {}
     discovery_errors: list[str] = []
-    for path_value in sorted(
-        glob.glob("/sys/devices/system/node/node*/cpulist")
-    ):
+    for path_value in sorted(glob.glob("/sys/devices/system/node/node*/cpulist")):
         path = Path(path_value)
         suffix = path.parent.name.removeprefix("node")
         if suffix.isdigit():
             try:
-                node_cpus[int(suffix)] = _parse_linux_cpu_list(
-                    path.read_text()
-                )
+                node_cpus[int(suffix)] = _parse_linux_cpu_list(path.read_text())
             except (OSError, ValueError) as exc:
-                discovery_errors.append(
-                    f"{path_value}:{type(exc).__name__}"
-                )
+                discovery_errors.append(f"{path_value}:{type(exc).__name__}")
     selected = _select_local_numa_cpuset(allowed, node_cpus)
     if selected is None:
-        error_suffix = (
-            f"; discovery_errors={','.join(discovery_errors)}"
-            if discovery_errors
-            else ""
+        _fail_open_minicpmo45_numa(
+            "no-node-intersection",
+            allowed,
+            ",".join(discovery_errors),
         )
-        raise RuntimeError(
-            "MiniCPM-o NUMA setup could not intersect the inherited CPU set "
-            "with /sys/devices/system/node/node*/cpulist"
-            f"{error_suffix}"
-        )
+        return
     node, cpus = selected
     status = "preserved" if cpus == allowed else "applied"
     if cpus != allowed:
-        os.sched_setaffinity(0, cpus)
-    effective = set(os.sched_getaffinity(0))
-    if effective != cpus:
-        raise RuntimeError(
-            "MiniCPM-o NUMA affinity verification failed: "
-            f"requested={_format_linux_cpu_list(cpus)} "
-            f"effective={_format_linux_cpu_list(effective)}"
+        try:
+            os.sched_setaffinity(0, cpus)
+        except OSError as exc:
+            _fail_open_minicpmo45_numa(
+                "set-affinity-failed",
+                allowed,
+                type(exc).__name__,
+            )
+            return
+    try:
+        effective = set(os.sched_getaffinity(0))
+    except OSError as exc:
+        _fail_open_minicpmo45_numa(
+            "verify-affinity-failed",
+            allowed,
+            type(exc).__name__,
         )
+        return
+    if effective != cpus:
+        _fail_open_minicpmo45_numa(
+            "verify-affinity-mismatch",
+            allowed,
+            f"requested={_format_linux_cpu_list(cpus)},observed={_format_linux_cpu_list(effective)}",
+        )
+        return
     effective_nodes = {
-        candidate_node
-        for candidate_node, candidate_cpus in node_cpus.items()
-        if effective & candidate_cpus
+        candidate_node for candidate_node, candidate_cpus in node_cpus.items() if effective & candidate_cpus
     }
     if effective_nodes != {node}:
-        raise RuntimeError(
-            "MiniCPM-o NUMA affinity is not local to exactly one node: "
-            f"selected={node} effective_nodes={sorted(effective_nodes)}"
+        _fail_open_minicpmo45_numa(
+            "verify-node-locality-mismatch",
+            allowed,
+            f"selected={node},effective_nodes={sorted(effective_nodes)}",
         )
+        return
     os.environ["_MINICPMO45_NUMA_AFFINITY"] = f"node{node}:{len(cpus)}"
-    os.environ["_MINICPMO45_NUMA_INHERITED_CPUSET"] = _format_linux_cpu_list(
-        allowed
-    )
-    os.environ["_MINICPMO45_NUMA_EFFECTIVE_CPUSET"] = _format_linux_cpu_list(
-        effective
-    )
+    os.environ["_MINICPMO45_NUMA_INHERITED_CPUSET"] = _format_linux_cpu_list(allowed)
+    os.environ["_MINICPMO45_NUMA_EFFECTIVE_CPUSET"] = _format_linux_cpu_list(effective)
     print(
         "[minicpmo45-numa] "
         f"status={status} "
@@ -139,8 +218,7 @@ def _limit_minicpmo45_npu_to_local_cpuset() -> None:
     )
     if discovery_errors:
         print(
-            "[minicpmo45-numa] ignored discovery errors: "
-            + ",".join(discovery_errors),
+            "[minicpmo45-numa] ignored discovery errors: " + ",".join(discovery_errors),
             file=sys.stderr,
             flush=True,
         )
@@ -158,15 +236,9 @@ def _maybe_prepare_minicpmo45_npu_runtime() -> None:
 
     if "serve" not in sys.argv or "--omni" not in sys.argv:
         return
-    if not any(
-        "minicpm-o-4_5" in arg.lower() or "minicpmo_4_5" in arg.lower()
-        for arg in sys.argv
-    ):
+    if not any("minicpm-o-4_5" in arg.lower() or "minicpmo_4_5" in arg.lower() for arg in sys.argv):
         return
-    if not (
-        os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-        or os.path.exists("/dev/davinci_manager")
-    ):
+    if not (os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.path.exists("/dev/davinci_manager")):
         return
 
     # Safe opt-out defaults: explicit user/evaluator values always win.
@@ -183,11 +255,36 @@ def _maybe_prepare_minicpmo45_npu_runtime() -> None:
         "1",
     )
     os.environ.setdefault(
+        "VLLM_OMNI_MINICPMO45_STAGE1_FIA_PREFIX_BARRIER_GATE0",
+        "1",
+    )
+    os.environ.setdefault(
+        "VLLM_OMNI_MINICPMO45_STAGE1_EOS_BATCH_K",
+        "4",
+    )
+    os.environ.setdefault(
         "VLLM_OMNI_MINICPMO45_STAGE2_FREEZE_HIFT_WEIGHT_NORM",
         "1",
     )
 
     _limit_minicpmo45_npu_to_local_cpuset()
+
+
+def _prepare_and_install_minicpmo45_stage1_fia_fixed192() -> None:
+    """Order the default preparation before the fixed192 plugin install.
+
+    Entry-point enumeration order is not part of the Python packaging
+    contract. Keeping the dependency explicit here prevents the fixed192
+    installer from observing its legacy default-off state when the official
+    ``vllm serve`` executable loads general plugins in a different order.
+    """
+    _maybe_prepare_minicpmo45_npu_runtime()
+
+    from vllm_omni.platforms.npu.ascend_stage1_fia_fixed192_patch import (
+        install_stage1_fia_fixed192_candidate,
+    )
+
+    install_stage1_fia_fixed192_candidate()
 
 
 def main():

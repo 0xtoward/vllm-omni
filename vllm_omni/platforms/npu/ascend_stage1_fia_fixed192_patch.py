@@ -24,8 +24,13 @@ from vllm_omni.platforms.npu.stage1_fia_fixed192_state import (
     UpdateAction,
     build_mask_row,
 )
+from vllm_omni.platforms.npu.stage1_fia_prefix_barrier_state import (
+    PrefixBarrierContractError,
+    PrefixBarrierState,
+)
 
 _ENV = "VLLM_OMNI_MINICPMO45_STAGE1_FIA_FIXED192"
+_PREFIX_BARRIER_ENV = "VLLM_OMNI_MINICPMO45_STAGE1_FIA_PREFIX_BARRIER_GATE0"
 _INSTALL_MARKER = "_vllm_omni_stage1_fia_fixed192_install_v1"
 _CAPTURE_MARKER = "_vllm_omni_stage1_fia_fixed192_capture_v1"
 _UPDATE_MARKER = "_vllm_omni_stage1_fia_fixed192_update_v1"
@@ -41,6 +46,12 @@ def _enabled() -> bool:
 
 def _mode_name(value: Any) -> str:
     return str(getattr(value, "name", value)).upper()
+
+
+def _prefix_barrier_gate0_enabled() -> bool:
+    return os.environ.get(_PREFIX_BARRIER_ENV, "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 @dataclass
@@ -60,6 +71,11 @@ class _Runtime:
         default_factory=list
     )
     last_log_total: int = 0
+    prefix_barrier_state: PrefixBarrierState = field(
+        default_factory=PrefixBarrierState
+    )
+    prefix_barrier_event: Any | None = None
+    prefix_barrier_proxies: list[Any] = field(default_factory=list)
 
     @classmethod
     def create(cls, torch: Any, device: Any) -> _Runtime:
@@ -237,9 +253,154 @@ def _fixed_metadata(unique: list[Any], runtime: _Runtime):
             metadata.causal = causal
 
 
+class _PrefixBarrierEventProxy:
+    """A per-FIA proxy; only site zero contributes a graph wait/reset."""
+
+    def __init__(self, runtime: _Runtime, site: int) -> None:
+        self._runtime = runtime
+        self._site = site
+
+    def wait(self, stream: Any) -> Any:
+        state = self._runtime.prefix_barrier_state
+        if state.capture_wait(self._site):
+            self._runtime.counters["prefix.capture_real_wait"] += 1
+            return self._runtime.prefix_barrier_event.wait(stream)
+        return None
+
+    def reset(self, stream: Any) -> Any:
+        state = self._runtime.prefix_barrier_state
+        if state.capture_reset(self._site):
+            self._runtime.counters["prefix.capture_real_reset"] += 1
+            return self._runtime.prefix_barrier_event.reset(stream)
+        return None
+
+    def record(self, stream: Any) -> None:
+        # Never release the real event here.  original_update must return and
+        # the wrapper must validate all twenty sites before the one real record.
+        self._runtime.prefix_barrier_state.observe_task_record(self._site)
+        self._runtime.counters["prefix.task_record_observed"] += 1
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._runtime.prefix_barrier_event, name)
+
+
+@contextmanager
+def _prefix_capture_event(runtime: _Runtime):
+    if not _prefix_barrier_gate0_enabled():
+        yield
+        return
+    state = runtime.prefix_barrier_state
+    site = state.allocate_capture_site()
+    torch = runtime.torch
+    original_factory = torch.npu.ExternalEvent
+    if runtime.prefix_barrier_event is None:
+        runtime.prefix_barrier_event = original_factory()
+    proxy = _PrefixBarrierEventProxy(runtime, site)
+    runtime.prefix_barrier_proxies.append(proxy)
+    factory_calls = 0
+
+    def proxy_factory(*args: Any, **kwargs: Any) -> Any:
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls != 1:
+            state.abort_capture(f"site {site} requested multiple ExternalEvents")
+        return proxy
+
+    torch.npu.ExternalEvent = proxy_factory
+    try:
+        yield
+    except BaseException as exc:
+        try:
+            state.abort_capture(f"site {site}: {type(exc).__name__}: {exc}")
+        except PrefixBarrierContractError as fatal:
+            raise fatal from exc
+    finally:
+        torch.npu.ExternalEvent = original_factory
+    if factory_calls != 1:
+        state.abort_capture(f"site {site} ExternalEvent calls={factory_calls}")
+    runtime.counters["prefix.capture_site"] += 1
+
+
+def _assert_prefix_registry(runtime: _Runtime, graph_params: Any) -> None:
+    state = runtime.prefix_barrier_state
+    state.assert_capture_complete()
+    try:
+        events = graph_params.events[1]
+    except (AttributeError, KeyError, TypeError) as exc:
+        state.abort_capture(f"missing event registry: {exc}")
+    if len(events) != _EXPECTED_TASKS:
+        state.abort_capture(f"event registry size={len(events)}")
+    if len({id(event) for event in events}) != _EXPECTED_TASKS:
+        state.abort_capture("event proxies are not twenty distinct objects")
+    for site, event in enumerate(events):
+        if not isinstance(event, _PrefixBarrierEventProxy):
+            state.abort_capture(f"event {site} is not a prefix proxy")
+        if event._runtime is not runtime or event._site != site:
+            state.abort_capture(f"event {site} proxy ownership/order mismatch")
+    if events != runtime.prefix_barrier_proxies:
+        state.abort_capture("event registry differs from capture proxy ledger")
+
+
+@contextmanager
+def _prefix_task_epoch(
+    runtime: _Runtime,
+    graph_params: Any,
+    num_tokens: int,
+    kind: str,
+    update_stream: Any,
+):
+    if not _prefix_barrier_gate0_enabled() or num_tokens != 1:
+        yield
+        return
+    _assert_prefix_registry(runtime, graph_params)
+    state = runtime.prefix_barrier_state
+    state.begin_task_epoch(kind)
+    try:
+        yield
+    except BaseException as exc:
+        runtime.counters["prefix.task_epoch_fatal"] += 1
+        try:
+            state.abort_task_epoch(f"{kind}: {type(exc).__name__}: {exc}")
+        except PrefixBarrierContractError as fatal:
+            raise fatal from exc
+    try:
+        state.prepare_task_release()
+        with runtime.torch.npu.stream(update_stream):
+            runtime.prefix_barrier_event.record(update_stream)
+        state.commit_task_release()
+    except BaseException as exc:
+        runtime.counters["prefix.task_epoch_fatal"] += 1
+        if not state.poisoned:
+            try:
+                state.abort_task_epoch(f"{kind} release: {type(exc).__name__}: {exc}")
+            except PrefixBarrierContractError as fatal:
+                raise fatal from exc
+        raise RuntimeError("prefix-barrier task epoch failed after validation") from exc
+    runtime.counters["prefix.task_epoch_success"] += 1
+    runtime.counters["prefix.real_record"] += 1
+
+
 def _record_only(runtime: _Runtime, update_stream: Any, graph_params: Any) -> None:
     torch = runtime.torch
     events = graph_params.events[1]
+    if _prefix_barrier_gate0_enabled():
+        _assert_prefix_registry(runtime, graph_params)
+        state = runtime.prefix_barrier_state
+        state.begin_record_only_release()
+        try:
+            with torch.npu.stream(update_stream):
+                runtime.prefix_barrier_event.record(update_stream)
+        except BaseException as exc:
+            runtime.counters["prefix.record_only_fatal"] += 1
+            try:
+                state.abort_record_only_release(f"{type(exc).__name__}: {exc}")
+            except PrefixBarrierContractError as fatal:
+                raise fatal from exc
+        state.commit_record_only_release()
+        runtime.counters["event.record_only"] += 1
+        runtime.counters["prefix.record_only_calls"] += 1
+        runtime.counters["prefix.real_record"] += 1
+        return
     with torch.npu.stream(update_stream):
         for event in events:
             event.record(update_stream)
@@ -445,9 +606,10 @@ def install_stage1_fia_fixed192_candidate() -> None:
         attn_metadata.attn_mask = runtime.target_mask
         attn_metadata.causal = False
         try:
-            result = original_capture(
-                self, query, key, value, attn_metadata, output, layer
-            )
+            with _prefix_capture_event(runtime):
+                result = original_capture(
+                    self, query, key, value, attn_metadata, output, layer
+                )
             runtime.stock_capture_descriptors.append(
                 (stock_mask, stock_sparse, stock_pre, stock_next)
             )
@@ -509,15 +671,18 @@ def install_stage1_fia_fixed192_candidate() -> None:
                 with _stock_task_params(
                     runtime, graph_params, num_tokens, source_table
                 ):
-                    result = original_update(
-                        update_stream,
-                        forward_context,
-                        num_tokens,
-                        vllm_config,
-                        speculative_config,
-                        num_dcp_pcp_tokens,
-                        draft_attn_metadatas,
-                    )
+                    with _prefix_task_epoch(
+                        runtime, graph_params, num_tokens, "STOCK_DYNAMIC", update_stream
+                    ):
+                        result = original_update(
+                            update_stream,
+                            forward_context,
+                            num_tokens,
+                            vllm_config,
+                            speculative_config,
+                            num_dcp_pcp_tokens,
+                            draft_attn_metadatas,
+                        )
             except Exception:
                 runtime.state.commit(observation, action, success=False)
                 raise
@@ -539,20 +704,14 @@ def install_stage1_fia_fixed192_candidate() -> None:
             # task contract, not merely call the stock updater with the fixed
             # captured tuple still installed.
             with _stock_task_params(runtime, graph_params, num_tokens, source_table):
-                return original_update(
-                    update_stream,
-                    forward_context,
+                with _prefix_task_epoch(
+                    runtime,
+                    graph_params,
                     num_tokens,
-                    vllm_config,
-                    speculative_config,
-                    num_dcp_pcp_tokens,
-                    draft_attn_metadatas,
-                )
-
-        if action is UpdateAction.FIXED_REBIND:
-            try:
-                with _fixed_metadata(unique, runtime):
-                    result = original_update(
+                    "DESCRIPTOR_COPY_STOCK_FALLBACK",
+                    update_stream,
+                ):
+                    return original_update(
                         update_stream,
                         forward_context,
                         num_tokens,
@@ -561,6 +720,22 @@ def install_stage1_fia_fixed192_candidate() -> None:
                         num_dcp_pcp_tokens,
                         draft_attn_metadatas,
                     )
+
+        if action is UpdateAction.FIXED_REBIND:
+            try:
+                with _fixed_metadata(unique, runtime):
+                    with _prefix_task_epoch(
+                        runtime, graph_params, num_tokens, "FIXED_REBIND", update_stream
+                    ):
+                        result = original_update(
+                            update_stream,
+                            forward_context,
+                            num_tokens,
+                            vllm_config,
+                            speculative_config,
+                            num_dcp_pcp_tokens,
+                            draft_attn_metadatas,
+                        )
             except Exception:
                 runtime.state.commit(observation, action, success=False)
                 raise
