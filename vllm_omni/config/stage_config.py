@@ -1029,11 +1029,11 @@ def _apply_minicpmo_4_5_npu_graph_defaults(
         stage.engine_extras["additional_config"] = additional
 
     # The challenge contract is strict single-concurrency.  Serialize any
-    # accuracy-suite burst internally and use the second logical die only for
-    # Code2Wav, leaving Thinker and Talker on die 0.  An explicit opt-out keeps
-    # the source usable on one-die development hosts.
+    # accuracy-suite burst internally and keep Thinker, Talker, and Code2Wav
+    # on logical die 0 by default.  An explicit opt-in preserves the validated
+    # dual-die placement for deployments that permit it.
     single_die = os.environ.get(
-        "VLLM_OMNI_MINICPMO45_SINGLE_DIE", "0"
+        "VLLM_OMNI_MINICPMO45_SINGLE_DIE", "1"
     ).strip().lower() in {"1", "true", "yes", "on"}
     for stage in deploy.stages:
         if stage.max_num_seqs is None or stage.max_num_seqs > 1:
