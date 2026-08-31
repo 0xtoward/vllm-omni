@@ -28,7 +28,10 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.experimental.fullduplex.engine.intermediate import (
+    get_tts_handoff,
+    normalize_handoff_tensor,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -542,6 +545,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
+            hidden_states = normalize_handoff_tensor(hidden_states)
             # Cross-process stage transport serializes CPU tensors as lists.
             # Normalize both local tensor handoffs and transported payloads
             # before validating/building the Talker condition.

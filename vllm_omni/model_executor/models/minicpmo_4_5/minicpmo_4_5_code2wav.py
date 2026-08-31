@@ -19,6 +19,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.fullduplex.engine.intermediate import normalize_handoff_tensor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .batched_token2wav import (
@@ -246,6 +247,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate: Any,
     ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
+        ref_audio = normalize_handoff_tensor(ref_audio)
         waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)

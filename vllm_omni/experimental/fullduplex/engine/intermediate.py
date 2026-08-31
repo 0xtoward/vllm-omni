@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
 from typing import TypedDict
+
+logger = logging.getLogger(__name__)
+_T44_UNPACK_LOGGED = False
 
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
@@ -82,6 +86,57 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
         info.get("tts_token_ids") if token_ids is None else token_ids,
         info.get("tts_hidden_states") if hidden_states is None else hidden_states,
     )
+
+
+def normalize_handoff_tensor(value: object) -> object:
+    """Rebuild a tensor encoded as a tagged raw-bytes stage handoff."""
+    global _T44_UNPACK_LOGGED
+    if isinstance(value, dict) and value.get("__t44_tensor__") is not None:
+        shape = [int(dimension) for dimension in value.get("shape", [])]
+        data = value.get("data")
+        try:
+            import numpy as np
+            import torch
+
+            dtype_name = str(value["__t44_tensor__"])
+            np_dtype = np.dtype(dtype_name)
+            if not data:
+                tensor = torch.empty(shape, dtype=getattr(torch, dtype_name))
+            else:
+                array = np.frombuffer(bytes(data), dtype=np.uint8)
+                tensor = torch.from_numpy(array.view(np_dtype).reshape(shape).copy())
+            if not _T44_UNPACK_LOGGED:
+                logger.info(
+                    "MINICPMO45_T44_HANDOFF event=unpack dtype=%s shape=%s",
+                    dtype_name,
+                    shape,
+                )
+                _T44_UNPACK_LOGGED = True
+            return tensor
+        except Exception:
+            logger.exception("MINICPMO45_T44_HANDOFF event=unpack_failed")
+            return value
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and isinstance(value[0], str)
+        and isinstance(value[1], (list, tuple))
+        and (isinstance(value[2], (bytes, memoryview, bytearray)) or value[2] is None)
+    ):
+        shape = [int(dimension) for dimension in value[1]]
+        data = value[2]
+        try:
+            import numpy as np
+            import torch
+
+            np_dtype = np.dtype(value[0])
+            if data is None or len(data) == 0:
+                return torch.empty(shape, dtype=getattr(torch, value[0]))
+            array = np.frombuffer(bytes(data), dtype=np.uint8)
+            return torch.from_numpy(array.view(np_dtype).reshape(shape).copy())
+        except Exception:
+            return value
+    return value
 
 
 def get_stream_request_key(info: dict[str, object]) -> str:

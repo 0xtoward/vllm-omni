@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -22,6 +23,7 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
+_T44_PACK_LOGGED = False
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -106,10 +108,27 @@ def _coerce_token_id_list(value):
 
 
 def _to_transport_list(value):
+    global _T44_PACK_LOGGED
     if hasattr(value, "detach"):
         value = value.detach().cpu()
     if isinstance(value, torch.Tensor):
-        return value.tolist()
+        if os.environ.get("VLLM_OMNI_HANDOFF_LIST_LEGACY", "0") == "1":
+            return value.tolist()
+        value = value.contiguous() if not value.is_contiguous() else value
+        payload = {
+            "__t44_tensor__": str(value.dtype).removeprefix("torch."),
+            "shape": list(value.shape),
+            "data": value.numpy().tobytes(),
+        }
+        if not _T44_PACK_LOGGED:
+            logger.info(
+                "MINICPMO45_T44_HANDOFF event=pack dtype=%s shape=%s bytes=%d",
+                payload["__t44_tensor__"],
+                payload["shape"],
+                len(payload["data"]),
+            )
+            _T44_PACK_LOGGED = True
+        return payload
     return value
 
 
