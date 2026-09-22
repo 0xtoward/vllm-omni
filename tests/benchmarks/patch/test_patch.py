@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
 )
+from vllm_omni.benchmarks.patch import patch
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _add_combined_video_form_references,
@@ -2011,3 +2012,36 @@ def test_image_metrics_persist_stage_durations_from_metrics() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+def test_get_samples_forwards_upstream_multimodal_backends_kwarg(mocker: MockerFixture) -> None:
+    """The patched ``datasets.get_samples`` must stay call-compatible upstream.
+
+    Upstream ``vllm.benchmarks.datasets.get_samples`` takes a keyword-only
+    ``multimodal_backends`` (``vllm/benchmarks/throughput.py`` passes it) and
+    ``patch.py`` rebinds that symbol module-wide, so a non-omni request must
+    forward the keyword to the original implementation instead of raising
+    ``TypeError`` or silently dropping it.
+    """
+    calls: list[tuple[Namespace, object, dict]] = []
+
+    def fake_get_samples_old(args, tokenizer, **kwargs):
+        calls.append((args, tokenizer, kwargs))
+        return ["delegated"]
+
+    mocker.patch.object(patch, "get_samples_old", fake_get_samples_old)
+
+    args = Namespace(
+        dataset_name="random",
+        backend="vllm-chat",
+        dataset_path=None,
+        hf_name=None,
+    )
+    sentinel = object()
+    mm_backends = ("openai-chat", "openai-audio")
+
+    assert patch.get_samples(args, sentinel, multimodal_backends=mm_backends) == ["delegated"]
+    assert calls == [(args, sentinel, {"multimodal_backends": mm_backends})]
+    # No upstream kwargs: unchanged legacy delegate call.
+    assert patch.get_samples(args, sentinel) == ["delegated"]
+    assert calls[-1] == (args, sentinel, {})
