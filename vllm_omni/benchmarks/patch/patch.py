@@ -1862,6 +1862,7 @@ async def async_request_openai_chat_omni_completions(
         output.peak_memory_mb = 0.0
         output.stage_durations = None
         completion_tokens_seen = 0
+        streaming_error_received = False
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -1889,6 +1890,13 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                if (streaming_error := data.get("error")) is not None:
+                                    streaming_error_received = True
+                                    if isinstance(streaming_error, dict):
+                                        output.error = str(streaming_error.get("message") or streaming_error)
+                                    else:
+                                        output.error = str(streaming_error)
+                                    continue
                                 _update_output_stage_metrics_from_payload(output, data)
                                 _update_output_peak_memory_from_payload(output, data)
                                 _update_output_stage_durations_from_payload(output, data)
@@ -2073,7 +2081,7 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
-                    output.success = True
+                    output.success = not streaming_error_received
                 else:
                     output.error = response.reason or ""
                     output.success = False

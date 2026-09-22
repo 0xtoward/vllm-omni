@@ -435,6 +435,45 @@ async def test_bundled_first_text_chunk_uses_stage0_token_timings(mocker: Mocker
 
 
 @pytest.mark.asyncio
+async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture):
+    """HTTP 200 streams can still terminate with an OpenAI error event."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "partial response"}}],
+                "modality": "text",
+            }
+        ),
+        create_sse_chunk(
+            {
+                "error": {
+                    "message": "EngineCore encountered an issue",
+                    "type": "BadRequestError",
+                    "code": 400,
+                }
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is False
+    assert output.error == "EngineCore encountered an issue"
+
+
+@pytest.mark.asyncio
 async def test_positive_client_text_timings_take_precedence_over_stage0(mocker: MockerFixture):
     request_input = RequestFuncInput(
         model="test-model",
