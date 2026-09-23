@@ -140,13 +140,10 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
 
 
 def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
-    if custom_pipeline_args is None:
+    if not custom_pipeline_args or "pipeline_class" not in custom_pipeline_args:
         return None
 
-    try:
-        pipeline_cls = custom_pipeline_args["pipeline_class"]
-    except KeyError as exc:
-        raise ValueError("custom_pipeline_args must include 'pipeline_class'.") from exc
+    pipeline_cls = custom_pipeline_args["pipeline_class"]
 
     if isinstance(pipeline_cls, type):
         return pipeline_cls
