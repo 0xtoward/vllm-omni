@@ -54,6 +54,7 @@ from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
+    get_diffusion_prefix_cache_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
@@ -130,7 +131,7 @@ __all__ = [
 
 
 def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
-    if func is None:
+    if not callable(func):
         return False
     parameters = inspect.signature(func).parameters
     return parameter_name in parameters or any(
@@ -300,6 +301,13 @@ class DiffusionEngine:
     def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        self.prefix_cache_func = get_diffusion_prefix_cache_func(od_config) if self._prefix_cache_enabled() else None
+        if self._prefix_cache_enabled() and self.prefix_cache_func is None:
+            raise ValueError(
+                "enable_prefix_caching=True requires a registered prefix-cache hook for "
+                f"{od_config.model_class_name!r}; "
+                "disable enable_prefix_caching or use a supported native pipeline such as HunyuanImage3ForCausalMM"
+            )
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
@@ -585,6 +593,7 @@ class DiffusionEngine:
         )
 
     def _busy_loop(self):
+        assert self.stop_event is not None
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
@@ -696,6 +705,7 @@ class DiffusionEngine:
 
         Caller must hold ``self._cv``.
         """
+        assert self.stop_event is not None
         start = time.monotonic()
         decision = self.scheduler.get_admission_wait_decision(
             now=start,
@@ -1045,6 +1055,12 @@ class DiffusionEngine:
         engine.run_startup_warmup()
         return engine
 
+    def _prefix_cache_enabled(self) -> bool:
+        config = getattr(self, "od_config", None)
+        return getattr(config, "diffusion_kv_mode", None) is DiffusionKVCacheMode.PAGED_SCHEDULER and bool(
+            getattr(config, "enable_prefix_caching", False)
+        )
+
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
@@ -1052,6 +1068,12 @@ class DiffusionEngine:
         if pre_process_func is not None:
             request = pre_process_func(request)
         self._validate_diffusion_kv_profile_limits(request)
+        # Gate cache-input preparation itself: disabled caching must not inspect
+        # tensors / RNG state or copy token IDs just to discard their hashes.
+        # Both dependency hashing and preprocessing stay outside Engine locks.
+        prefix_cache_func = getattr(self, "prefix_cache_func", None)
+        if self._prefix_cache_enabled() and prefix_cache_func is not None and request.diffusion_kv_requests:
+            prefix_cache_func(request)
         return request
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
@@ -1192,7 +1214,7 @@ class DiffusionEngine:
                 # sync func should receive one result
                 if (
                     sched_output.scheduled_request_ids
-                    and not isinstance(runner_output, RunnerOutput)
+                    and isinstance(runner_output, BatchRunnerOutput)
                     and len(runner_output) != 1
                 ):
                     raise ValueError("Sync func should receive one result at one time")
@@ -1249,7 +1271,7 @@ class DiffusionEngine:
         num_inference_steps: int = 1,
         num_frames: int | None = None,
     ) -> OmniDiffusionRequest | None:
-        """Build a minimal model request for startup profiling or warmup."""
+        """Build a startup request; explicit frame counts bypass the warmup policy."""
         prompt = OmniTextPrompt(prompt="dummy run")
         model_class_name = self.od_config.model_class_name
         if model_class_name is None:
