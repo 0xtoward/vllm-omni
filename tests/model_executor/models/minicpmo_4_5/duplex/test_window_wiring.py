@@ -547,7 +547,7 @@ def test_scheduler_worker_end_to_end_state_agreement():
         },
     )
 
-    plan = MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update)
+    plan = MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update)
     assert plan is not None
     assert plan.delta == 16
     assert plan.moved_from == 32
@@ -884,7 +884,7 @@ def test_rejection_before_state_mutation():
         },
     )
 
-    result = MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update)
+    result = MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update)
     assert result is None
     # Verify zero state mutation: token sequences and counters are untouched!
     assert session.prompt_token_ids == [1, 2, 3, 4]
@@ -906,7 +906,7 @@ def test_non_duplex_regression():
     # Case 1: No duplex in buffer
     update1 = SimpleNamespace(prompt_token_ids=[4], model_intermediate_buffer={})
     scheduler = SimpleNamespace()
-    assert MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update1) is None
+    assert MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update1) is None
     assert session.num_computed_tokens == 3
 
     # Case 2: sliding_window_mode = 'off'
@@ -921,7 +921,7 @@ def test_non_duplex_regression():
             }
         },
     )
-    assert MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update2) is None
+    assert MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update2) is None
     assert session.num_computed_tokens == 3
 
 
@@ -1009,18 +1009,6 @@ def test_scheduler_replace_streaming_prompt_bypasses_reanchor():
     assert session.released is True
     assert session.replaced is True
     assert len(reanchor_called) == 0, "Re-anchoring must not be called when replacing streaming prompt!"
-
-
-def test_slot_mapping_device_compatibility():
-    """Verify compute_slot_mapping creates table on positions device and does not error on CUDA/device tensor."""
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import compute_slot_mapping
-
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-    pos = torch.tensor([0, 15, 16, 31, 32], dtype=torch.long, device=device)
-    block_ids = [10, 20, 30]
-    slots = compute_slot_mapping(block_ids, pos, block_size=16)
-    assert slots.device == device
-    assert slots.tolist() == [10 * 16 + 0, 10 * 16 + 15, 20 * 16 + 0, 20 * 16 + 15, 30 * 16 + 0]
 
 
 def test_reanchor_ordinary_append_fallback_rebuild_sequence():

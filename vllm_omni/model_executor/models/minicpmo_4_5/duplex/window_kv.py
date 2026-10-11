@@ -119,21 +119,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
 DUPLEX_WINDOW_BLOCK_SIZE = 16
 
 
-def compute_slot_mapping(
-    block_ids: list[int] | torch.Tensor,
-    positions: list[int] | torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Map token positions to physical slot indices across a block table."""
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}")
-    pos = torch.as_tensor(positions, dtype=torch.long)
-    table = torch.as_tensor(block_ids, dtype=torch.long, device=pos.device)
-    block_index = torch.div(pos, block_size, rounding_mode="floor")
-    offset = pos % block_size
-    return table[block_index] * block_size + offset
-
-
 def duplex_window_geometry(
     *,
     prefix_tokens: int,
@@ -207,22 +192,6 @@ class MiniCPMO45DuplexWindowManager(ChunkWindowManager):
         """Never free behind the compaction's back."""
         del num_computed_tokens
         return 0
-
-    def plan_reanchor(
-        self,
-        geometry: DuplexWindowGeometry,
-        *,
-        computed_tokens: int,
-        pending_tokens: int,
-        unit_tokens: list[int] | None = None,
-    ) -> PositionReanchor | None:
-        """Whether the next append pushes the session past its window."""
-        return plan_position_reanchor(
-            geometry,
-            computed_tokens=computed_tokens,
-            pending_tokens=pending_tokens,
-            unit_tokens=unit_tokens,
-        )
 
     def compact_block_table(self, request_id: str, sink_blocks: int | None = None) -> int:
         if getattr(self, "enable_caching", False):
@@ -777,27 +746,6 @@ class MiniCPMO45DuplexSchedulerHelper:
             session._minicpmo45_window_open_start = max(0, recorded_open_start - freed_tokens)
 
         return plan
-
-    @classmethod
-    def maybe_reanchor_session(
-        cls,
-        scheduler: Any,
-        session: Any,
-        update: Any,
-        *,
-        segment_output_ids: list[int] | None = None,
-        completed_terminator: int | None = None,
-        unit_tokens: list[int] | None = None,
-    ) -> PositionReanchor | None:
-        """Backward-compatible alias for apply_session_window."""
-        return cls.apply_session_window(
-            scheduler,
-            session,
-            update,
-            segment_output_ids=segment_output_ids,
-            completed_terminator=completed_terminator,
-            unit_tokens=unit_tokens,
-        )
 
 
 class MiniCPMO45DuplexWorkerHelper:
