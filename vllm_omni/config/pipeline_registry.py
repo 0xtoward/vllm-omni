@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.lingbot_vla_v2_pipeline_config import LINGBOT_VLA_V2_PIPELINE
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
@@ -210,6 +211,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "nemotron_voicechat": NEMOTRON_VOICECHAT_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
+    "lingbot_vla_v2": LINGBOT_VLA_V2_PIPELINE,
     "pi0": PI0_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
