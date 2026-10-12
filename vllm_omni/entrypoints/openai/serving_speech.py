@@ -324,6 +324,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _media_connector: MediaConnector | None = None
     _allowed_local_media_path: str = ""
     _tts_executor: ThreadPoolExecutor | None = None
+    # Scratch directory shared by the API processes of a multi-API server.
+    api_server_shared_dir: str | None = None
 
     def _init_speaker_storage(self) -> None:
         """Initialize speaker storage + cache, restoring any persisted uploads."""
@@ -473,6 +475,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._allowed_local_media_path = ""
         self.model_name = kwargs.pop("model_name", None)
         self.speech_cache_config = kwargs.pop("speech_cache_config", None) or SpeechCacheConfig()
+        self.api_server_shared_dir = kwargs.pop("api_server_shared_dir", None)
         # True when the server was launched with --forced-aligner (a pooling
         # aligner stage is appended to the pipeline). Gates word_timestamps.
         self.forced_aligner_enabled: bool = bool(kwargs.pop("forced_aligner_enabled", False))
@@ -1924,7 +1927,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             ) as chunks:
                 async for chunk in chunks:
-                    payload = {
+                    payload: dict[str, Any] = {
                         "type": "speech.audio.delta",
                         "audio": base64.b64encode(chunk).decode("ascii"),
                         "response_format": response_format,
