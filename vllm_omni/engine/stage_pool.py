@@ -768,6 +768,11 @@ class StagePool:
         stage_metrics.vllm_tpot_ms = float(native_text_metrics.get("vllm_tpot_ms") or 0.0)
         stage_metrics.vllm_itl_ms = float(native_text_metrics.get("vllm_itl_ms") or 0.0)
         stage_metrics.vllm_itls_ms = list(native_text_metrics.get("vllm_itls_ms") or [])
+        # An absent key means the phase was not observed; keep it None, not 0.
+        stage_metrics.vllm_queued_ms = native_text_metrics.get(defs.VLLM_QUEUED_MS)
+        stage_metrics.vllm_prefill_ms = native_text_metrics.get(defs.VLLM_PREFILL_MS)
+        stage_metrics.vllm_decode_ms = native_text_metrics.get(defs.VLLM_DECODE_MS)
+        stage_metrics.vllm_num_preemptions = native_text_metrics.get(defs.VLLM_NUM_PREEMPTIONS)
         return stage_metrics
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
