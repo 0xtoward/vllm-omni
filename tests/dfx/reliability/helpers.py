@@ -543,6 +543,27 @@ def _resolve_runtime_worker_markers(
     return tuple(dict.fromkeys(merged))
 
 
+def _pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is gone or only a zombie remains."""
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def _wait_until_pid_dead(pid: int, timeout_sec: float) -> bool:
+    """Poll until ``pid`` is dead or ``timeout_sec`` elapses."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if _pid_is_dead(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
     """True when process name or argv contains any resolved worker marker substring."""
     if not markers:
@@ -1055,17 +1076,36 @@ def make_process_kill_fault_injector(
                     flush=True,
                 )
                 os.kill(pid, sig)
+                waited_from = time.monotonic()
+                dead = _wait_until_pid_dead(pid, post_kill_wait_seconds)
+                remaining = post_kill_wait_seconds - (time.monotonic() - waited_from)
+                if dead and remaining > 0:
+                    time.sleep(remaining)
+                print(
+                    f"[reliability][process-kill] killed pid={pid} stage={name} signal={signal_name} dead={int(dead)}",
+                    flush=True,
+                )
+                if signal_name == "SIGKILL" and not dead:
+                    raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
+            host = getattr(server, "host", None)
+            port = getattr(server, "port", None)
+            if host is not None and port is not None:
+                try:
+                    status, _body = get_health_raw(str(host), int(port), timeout_sec=5)
+                    print(
+                        f"[reliability][process-kill] post-kill health status={status}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - log the probe, do not hide the kill
+                    print(
+                        f"[reliability][process-kill] post-kill health error={exc!r}",
+                        flush=True,
+                    )
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
                 flush=True,
             )
-            if post_kill_wait_seconds > 0:
-                print(
-                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                    flush=True,
-                )
-                time.sleep(post_kill_wait_seconds)
 
         for pattern in patterns:
             print(
