@@ -792,6 +792,40 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "Qwen3-Omni Function Expansion" not in AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8")
 
 
+def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
+    label = "Stable Audio CPU Offload"
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 60
+    assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-cpu-offload/**/*"]
+    assert "retry" not in step
+    assert "env" not in step
+    _assert_build_scoped_aiter_mha_cache(
+        step,
+        "tests/diffusion/offloader/test_diffusion_cpu_offload.py",
+        publishes=False,
+    )
+
+    commands = "\n".join(step["commands"])
+    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
+    assert "VLLM_ROCM_USE_AITER" not in commands
+    assert "test_diffusion_layerwise_offload.py" not in commands
+    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
+    assert "full_model and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "pytest.log" in commands
+
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert label not in text
+        assert "full_model and rocm and MI325 and cards_1" not in text
+
+
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     runner = AMD_RUNNER.read_text(encoding="utf-8")
     template = AMD_TEMPLATE.read_text(encoding="utf-8")
