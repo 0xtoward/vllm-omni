@@ -55,6 +55,8 @@ OMNI_PROCESSOR_FULL_LABEL = "Simple · Omni Processor Test"
 OMNI_PROCESSOR_SMOKE_LABEL = "Simple · Omni Processor Snapshot Smoke"
 OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
+QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
+QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
 
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
@@ -84,6 +86,91 @@ def _walk_steps(steps: list[dict]):
     for step in steps:
         yield step
         yield from _walk_steps(step.get("steps", []))
+
+
+def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    return [
+        step
+        for step in _walk_steps(pipeline["steps"])
+        if any(node in split(command) for command in step.get("commands", []))
+    ]
+
+
+def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
+    owners = [
+        (pipeline_path, step)
+        for pipeline_path in (
+            AMD_READY_PIPELINE,
+            AMD_MERGE_PIPELINE,
+            AMD_NIGHTLY_PIPELINE,
+        )
+        for step in _steps_selecting_node(pipeline_path, QWEN_IMAGE_SMOKE_NODE)
+    ]
+
+    assert len(owners) == 1
+    assert owners[0][0] == AMD_NIGHTLY_PIPELINE
+    assert owners[0][1]["label"] == QWEN_IMAGE_SMOKE_LABEL
+
+
+def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
+    step = _find_step(QWEN_IMAGE_SMOKE_LABEL, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"].startswith("mi300_")
+    card_count = step["agent_pool"].rsplit("_", 1)[1]
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] >= 90
+    assert "depends_on" not in step
+    assert "retry" not in step
+    assert len(step["artifact_paths"]) == 1
+    assert step["artifact_paths"][0].startswith("artifacts/rocm-")
+    assert step["artifact_paths"][0].endswith("/**/*")
+
+    commands = step["commands"]
+    all_commands = "\n".join(commands)
+    env = step.get("env", {})
+    assert env.get("VLLM_ROCM_USE_AITER") == "1" or ("export VLLM_ROCM_USE_AITER=1" in commands)
+    assert env.get("DIFFUSION_ATTENTION_BACKEND") == "FLASH_ATTN" or (
+        "export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN" in commands
+    )
+    assert "AITER_JIT_DIR" in all_commands
+    assert "TORCH_EXTENSIONS_DIR" in all_commands
+    assert "|| true" not in all_commands
+
+    pytest_commands = [command for command in commands if "pytest" in split(command)]
+    collect_commands = [command for command in pytest_commands if "--collect-only" in split(command)]
+    run_commands = [command for command in pytest_commands if "--collect-only" not in split(command)]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_argv = split(collect_commands[0])
+    run_argv = split(run_commands[0])
+    collect_nodes = [arg for arg in collect_argv if arg.startswith("tests/") and "::" in arg]
+    run_nodes = [arg for arg in run_argv if arg.startswith("tests/") and "::" in arg]
+    assert len(collect_nodes) == 1
+    assert run_nodes == collect_nodes
+
+    expected_markers = f"full_model and diffusion and rocm and MI325 and cards_{card_count}"
+    assert collect_argv[collect_argv.index("-m") + 1] == expected_markers
+    assert run_argv[run_argv.index("-m") + 1] == expected_markers
+    assert collect_argv[collect_argv.index("--run-level") + 1] == "full_model"
+    assert run_argv[run_argv.index("--run-level") + 1] == "full_model"
+    assert "exit 5" in collect_commands[0]
+    assert "index($$0, node)" in collect_commands[0]
+
+    command_timeout = f"{step['timeout_in_minutes'] - 15}m"
+    assert run_argv[:4] == [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=2m",
+        command_timeout,
+    ]
+    assert "--durations=0" in run_argv
+    assert any(arg.startswith("--junitxml=") for arg in run_argv)
+    assert "|" in run_argv
+    assert "tee" in run_argv
+    assert "record_cache_metadata" not in all_commands
 
 
 def _find_steps_selecting_path(pipeline_path: Path, test_path: str) -> list[dict]:
