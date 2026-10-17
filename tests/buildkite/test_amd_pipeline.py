@@ -792,6 +792,43 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     assert "Qwen3-Omni Function Expansion" not in AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8")
 
 
+def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
+    path = "tests/e2e/offline_inference/test_cosyvoice3_expansion.py"
+    markers = "slow and tts and rocm and MI325 and cards_1"
+    step = _find_step("CosyVoice3 Offline Zero-shot Smoke", AMD_NIGHTLY_PIPELINE)
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 90
+    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert step["artifact_paths"] == ["artifacts/rocm-cosyvoice3-offline-nightly/**/*"]
+    assert "env" not in step
+
+    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
+    assert len(pytest_commands) == 2
+    collect_command = next(command for command in pytest_commands if "--collect-only" in split(command))
+    run_command = next(command for command in pytest_commands if "--collect-only" not in split(command))
+    for command in (collect_command, run_command):
+        argv = split(command)
+        assert path in argv
+        assert argv[argv.index("-m") + 1] == markers
+        assert argv[argv.index("--run-level") + 1] == "full_model"
+    assert "--junitxml=/tmp/cosyvoice3-offline-pytest.xml" in split(run_command)
+
+    commands = "\n".join(step["commands"])
+    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
+    assert "VLLM_ROCM_USE_AITER" not in commands
+    assert "cp -v /tmp/cosyvoice3-offline-pytest.xml" in commands
+
+    source = Path(path).read_text(encoding="utf-8")
+    decorator = source.rsplit("@hardware_test", 1)[1].split("def test_cosyvoice3_offline_reference_zero_shot", 1)[0]
+    assert '"cuda": "L4"' in decorator
+    assert '"rocm": "MI325"' in decorator
+    assert 'id="sync"' in source
+    assert 'id="async_chunk"' in source
+
+
 def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
     label = "Stable Audio CPU Offload"
     step = _find_step(label, AMD_NIGHTLY_PIPELINE)
