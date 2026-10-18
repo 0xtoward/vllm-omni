@@ -33,6 +33,7 @@ from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
@@ -123,6 +124,164 @@ async def open_qwen():
     )
     await harness.settle()
     return harness
+
+
+def _register_exposed_call(
+    h,
+    call_id: str,
+    *,
+    name: str = "get_weather",
+    arguments: str = '{"city":"Paris"}',
+    note: bool = True,
+) -> None:
+    """Record the call the session publishes, not a history item.
+
+    Admission reads the ledger. Stuffing ``conversation_items`` does not
+    expose a call. ``note`` is false when the test already stored the Qwen
+    history anchor at an earlier length.
+    """
+    h.runner.tool_calls.register(
+        ToolCallOrigin(
+            call_id=call_id,
+            epoch=h.session.epoch,
+            turn_id=h.session.turn_id,
+            response_id=f"resp_{call_id}",
+            item_id=f"item_{call_id}",
+            name=name,
+            arguments=arguments,
+        )
+    )
+    if not note:
+        return
+    noted = h.runner.plugin.note_published_function_call(
+        h.session.runtime_config,
+        call_id=call_id,
+        history_len=len(h.session.history),
+    )
+    if noted is not None:
+        h.session.replace_runtime_config(noted)
+
+
+async def _publish_call(
+    h,
+    call_id: str,
+    *,
+    name: str = "get_weather",
+    arguments: str = '{"city":"Paris"}',
+) -> None:
+    """Publish through ``_expose_function_call``, the session's real path.
+
+    That records the ledger origin, stores the Qwen anchor, and emits
+    ``function_call.done``. Calling ``register`` by itself can drift from
+    the ids and ordering production uses.
+    """
+    await h.runner.model._expose_function_call({"call_id": call_id, "name": name, "arguments": arguments})
+    await h.settle()
+
+
+def _published_call(events, call_id: str):
+    return [
+        event
+        for event in events
+        if event.type == "response.function_call_arguments.done" and getattr(event, "call_id", None) == call_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parsed_qwen_call_registers_the_publish_anchor():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        await h.runner.model._send_one_model_output_event(
+            {
+                "qwen_function_call": {
+                    "call_id": "call_paris",
+                    "name": "get_weather",
+                    "arguments": {"city": "Paris"},
+                }
+            }
+        )
+        published = await h.settle()
+        done = _published_call(published, "call_paris")
+        assert len(done) == 1
+        assert done[0].arguments == '{"city": "Paris"}'
+        record = h.runner.tool_calls.record("call_paris")
+        assert record is not None and record.origin.arguments == '{"city": "Paris"}'
+        assert h.session.runtime_config["qwen_call_anchors"]["call_paris"] == 1
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        assert not any(getattr(event, "code", None) for event in created)
+        turns = h.session.runtime_config["qwen_tool_turns"]
+        assert turns[0]["history_len"] == 1
+        assert turns[0]["messages"][1]["content"] == "18C"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_alone_does_not_expose_a_call():
+    h = await open_qwen()
+    try:
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_x",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_x", "output": "18C"}
+                ),
+            )
+        )
+        assert any(getattr(event, "code", None) == "invalid_function_call_output" for event in created)
+        assert "conversation.item.created" not in [event.type for event in created]
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        started = await h.run(CreateResponse())
+        assert any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_nonserializable_arguments_are_not_published():
+    h = await open_qwen()
+    try:
+        await h.runner.model._send_one_model_output_event(
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()}
+        )
+        events = await h.settle()
+        assert any(getattr(event, "code", None) == "invalid_function_call" for event in events)
+        assert _published_call(events, "call_1") == []
+        assert h.runner.tool_calls.record("call_1") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_note_published_failure_closes_the_unpublished_call():
+    h = await open_qwen()
+    try:
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("anchor failed")
+
+        h.runner.plugin.note_published_function_call = boom
+        await h.runner.model._expose_function_call({"call_id": "call_paris", "name": "get_weather", "arguments": "{}"})
+        events = await h.settle()
+        assert any(getattr(event, "code", None) == "tool_call_registration_failed" for event in events)
+        assert _published_call(events, "call_paris") == []
+        assert any(event.type == "session.closed" for event in events)
+        assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -984,13 +1143,7 @@ async def test_response_create_after_function_call_output_opens_one_follow_up():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        await _publish_call(h, "call_1")
         created = await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1029,13 +1182,7 @@ async def test_late_playback_ack_stores_the_answer_and_drops_the_tool_pair():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1070,13 +1217,7 @@ async def test_user_turn_before_playback_ack_still_sees_the_tool_pair():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1122,13 +1263,7 @@ async def test_playback_clear_before_ack_puts_the_tool_pair_back():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1160,13 +1295,7 @@ async def test_overlap_barge_in_before_playback_keeps_the_tool_result():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1197,13 +1326,7 @@ async def test_overlap_barge_in_after_partial_playback_leaves_the_tool_pair_infl
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1262,13 +1385,7 @@ async def test_failed_follow_up_stays_armed_and_keeps_the_call_time_anchor():
         assert noted is not None
         h.session.replace_runtime_config(noted)
         h.session.append_history_message({"role": "user", "content": "Tokyo"})
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_paris",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        _register_exposed_call(h, "call_paris", note=False)
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1307,13 +1424,7 @@ async def test_cancel_before_the_follow_up_is_stored_keeps_the_tool_pair():
         )
         assert noted is not None
         h.session.replace_runtime_config(noted)
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_paris",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        _register_exposed_call(h, "call_paris", note=False)
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1349,13 +1460,7 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
         )
         assert noted is not None
         h.session.replace_runtime_config(noted)
-        projector = h.runner.out.require_projector()
-        projector.conversation_items["item_call"] = {
-            "type": "function_call",
-            "call_id": "call_paris",
-            "name": "get_weather",
-            "arguments": '{"city":"Paris"}',
-        }
+        _register_exposed_call(h, "call_paris", note=False)
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(

@@ -704,9 +704,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return None
         if not isinstance(arguments, str):
             try:
-                arguments = json.dumps(arguments, ensure_ascii=False)
+                arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
             except (TypeError, ValueError):
-                arguments = str(arguments)
+                # Same shape as an invalid tool tag: the session rejects the
+                # call instead of publishing ``str(arguments)`` as JSON.
+                return {"call_id": "invalid", "name": ""}
         return {"call_id": call_id, "name": name, "arguments": arguments}
 
     def runtime_config_for_function_output(

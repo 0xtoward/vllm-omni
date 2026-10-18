@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -542,11 +543,6 @@ class DuplexModelPlugin(ABC):
         del model_result
         return None
 
-    # Optional hook: build the runtime config patch for a function-call output
-    # item. ``name`` and ``arguments`` on that item are the call context for
-    # this preparation. A plugin that needs them reads those fields and refuses
-    # when they are absent. Parsing and this method do not consume a
-    # plugin-local call cache. Plugins without tools keep the default (no change).
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,
@@ -555,6 +551,18 @@ class DuplexModelPlugin(ABC):
         *,
         history_len: int | None = None,
     ) -> dict[str, object] | None:
+        """Prepare a result candidate without committing plugin bookkeeping.
+
+        The session revalidates epoch and deadline after conversion. Do not
+        consume a call's cached metadata here: a candidate can still be refused.
+        Terminal bookkeeping belongs in ``on_tool_call_settled``.
+        ``item`` is an isolated preparation copy. Its ``name`` and ``arguments``
+        come only from the session's immutable call origin, when available;
+        client-supplied hints are ignored. Plugins requiring that context must
+        refuse missing metadata instead of guessing an association. The public
+        acknowledgement still carries the original submitted item.
+        Plugins without tools keep the default (no change).
+        """
         del config, current, item, history_len
         return None
 
@@ -634,6 +642,48 @@ class DuplexModelPlugin(ABC):
         del runtime_config, committed, awaiting_playback, response_id, release_owner
         return None
 
+    def on_tool_call_settled(self, settlement: ToolCallSettlement) -> None:
+        """Finalize only the named call's cached metadata after its decision.
+
+        A terminal notification may outlive its origin epoch. This cleanup must
+        not change model input, runtime config or continuation state. The
+        separate recovery hook is fenced against superseded epochs.
+        """
+        del settlement
+
+    def on_tool_calls_closed(self, origins: tuple[ToolCallOrigin, ...]) -> None:
+        """Dispose cached metadata for this session's calls, including pending.
+
+        Close can overtake queued terminal notifications. Cleanup must be
+        idempotent because some calls have already been finalized individually.
+        This does not perform model recovery or change another session's state.
+        """
+        del origins
+
+    def runtime_config_for_tool_call_timeout(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        settlement: ToolCallSettlement,
+    ) -> dict[str, object] | None:
+        """Prepare model recovery for one newly timed-out call on the mailbox.
+
+        This is called only for a timeout still in the current epoch,
+        never during speculative result conversion. Cached metadata cleanup
+        belongs in ``on_tool_call_settled`` and runs even if an epoch changed.
+        Plugins may prepare call-scoped model recovery here. Returning ``None``
+        requests no runtime-config change; it is
+        not an acknowledgement that the worker consumed anything. A timeout
+        must not reset the session or retire another call's queued result.
+
+        Raising closes the session: the owner cannot safely retry partial
+        model/bookkeeping effects. Closed or superseded decisions are skipped.
+        Accepted and cancelled calls never enter this hook. Their prepared
+        delivery or epoch-wide cancellation path remains the only model effect.
+        """
+        del config, current, settlement
+        return None
+
     def runtime_config_after_model_output(
         self,
         current: Mapping[str, object],
@@ -646,6 +696,37 @@ class DuplexModelPlugin(ABC):
         the framework unaware of model-specific metadata.
         """
         del current, output_metadata
+        return None
+
+    def retire_pending_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Answer what a cancelled epoch does to an accepted-but-unconsumed result.
+
+        A ``function_call_output`` is accepted into the runtime config, and a
+        frame-locked model may only pick it up on a later frame. When the epoch
+        advances (a cancel or barge-in), that queued frame belongs to the
+        generation that was just cancelled and must not be spoken in the next
+        one. Plugins with a queued function channel override this; the default
+        keeps nothing queued and returns ``None`` (no change).
+
+        A history-spliced pair is a different owner. Qwen puts that pair back
+        through ``runtime_config_after_response`` when the response is cancelled
+        or cleared before its text is stored, and a later ``response.create``
+        may answer it in the new epoch. This hook does not drop that pair.
+        The epoch bump still cancels pending ledger calls.
+
+        Returning a config must not reset a monotonic cursor the worker keys
+        its "already consumed" watermark on -- only the queue itself is retired.
+
+        Raising is a fail-closed answer, not a soft error: the framework cannot
+        verify a runtime is clean on its own, so a plugin that cannot retire its
+        queue ends the session rather than let the cancelled generation's result
+        be spoken in the new epoch.
+        """
+        del config, current
         return None
 
 

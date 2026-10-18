@@ -54,6 +54,7 @@ from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, 
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -73,6 +74,8 @@ def _response_awaits_playback_ack(session, response_id, *, should_commit: bool, 
 
 
 _INVALID_FUNCTION_CALL = object()
+_MISSING_CALL_ID = "A recognized function call requires call_id and name"
+_ARGUMENTS_MUST_BE_JSON = "Function call arguments must be a JSON string"
 
 
 def _coerce_function_call(raw: object) -> dict[str, str] | None:
@@ -85,43 +88,59 @@ def _coerce_function_call(raw: object) -> dict[str, str] | None:
         return None
     if not isinstance(arguments, str):
         try:
-            arguments = json.dumps(arguments, ensure_ascii=False)
+            arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError):
-            arguments = str(arguments)
+            return None
     return {"call_id": call_id, "name": name, "arguments": arguments}
 
 
-def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
-    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+def _legacy_function_call(model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """The pre-parse ``function_call`` flag, or None when it is not set.
 
-    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. A missing
-    legacy ``call_id``/``name`` returns None so the caller can still project
-    the raw event. Plugins without ``parse_function_call`` are treated as no call.
+    A set flag that lacks ``call_id`` and ``name`` is invalid. There is no
+    second coerce at the caller.
     """
-    parse = getattr(plugin, "parse_function_call", None)
-    if not callable(parse):
-        if model_result.get("function_call") is not True:
-            return None
-        return _coerce_function_call(
-            {
-                "call_id": model_result.get("call_id"),
-                "name": model_result.get("name"),
-                "arguments": model_result.get("arguments", ""),
-            }
-        )
-    parsed = parse(model_result)
-    if parsed is not None:
-        call = _coerce_function_call(parsed)
-        return call if call is not None else _INVALID_FUNCTION_CALL
     if model_result.get("function_call") is not True:
         return None
-    return _coerce_function_call(
+    call = _coerce_function_call(
         {
             "call_id": model_result.get("call_id"),
             "name": model_result.get("name"),
             "arguments": model_result.get("arguments", ""),
         }
     )
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+
+    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. Plugins
+    without ``parse_function_call`` are no call unless the legacy flag is set.
+    """
+    parse = getattr(plugin, "parse_function_call", None)
+    if not callable(parse):
+        return _legacy_function_call(model_result)
+    parsed = parse(model_result)
+    if parsed is None:
+        return _legacy_function_call(model_result)
+    call = _coerce_function_call(parsed)
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _invalid_function_call_message(plugin: object, model_result: Mapping[str, object]) -> str:
+    """Why a recognized call was refused, for the client error text."""
+    parse = getattr(plugin, "parse_function_call", None)
+    candidate = parse(model_result) if callable(parse) else model_result
+    if candidate is None:
+        candidate = model_result
+    if not isinstance(candidate, Mapping):
+        return _MISSING_CALL_ID
+    call_id = candidate.get("call_id")
+    name = candidate.get("name")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return _MISSING_CALL_ID
+    return _ARGUMENTS_MUST_BE_JSON
 
 
 class SilenceContinuationScheduler(Protocol):
@@ -997,29 +1016,68 @@ class ModelChannel:
         return close_reason, emitted_response
 
     async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
-        """Publish one recognized call as ``function_call.done``.
+        """Register a recognized call before publishing it.
 
-        Parsed calls enter here before the client can see them. #8758 registers
-        the session call origin in this method before the same publish.
+        Parsing stays in the model plugin. The session ledger is the admission
+        book. After the origin is stored, a plugin that splices the result into
+        history can record where the call sat.
         """
         session = self._ctx.session
-        call_id = function_call["call_id"]
-        if isinstance(call_id, str) and call_id:
+        call_id, name = function_call.get("call_id"), function_call.get("name")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            self._out.emit_error("invalid_function_call", _MISSING_CALL_ID)
+            return
+        arguments = function_call.get("arguments", "")
+        if not isinstance(arguments, str):
+            self._out.emit_error("invalid_function_call", _ARGUMENTS_MUST_BE_JSON)
+            return
+        item_id = f"item_{uuid.uuid4().hex}"
+        response_id = f"resp_{uuid.uuid4().hex}"
+        try:
+            self._ctx.tool_calls.register(
+                ToolCallOrigin(
+                    call_id=call_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                    response_id=response_id,
+                    item_id=item_id,
+                    name=name,
+                    arguments=arguments,
+                )
+            )
+        except ToolCallRegistrationError as exc:
+            self._out.emit_error(exc.code, str(exc))
+            if exc.code != "resource_exhausted":
+                await self._close_from_runtime("tool_call_lifecycle")
+            return
+        try:
             updated_runtime = self._ctx.plugin.note_published_function_call(
                 session.runtime_config,
                 call_id=call_id,
                 history_len=len(session.history),
             )
-            if updated_runtime is not None:
-                session.replace_runtime_config(updated_runtime)
+        except Exception:
+            # The call is already in the ledger and the client has not seen it.
+            # Leaving it pending would time out a call that was never published.
+            logger.exception("Failed to record a published function call")
+            self._out.emit_error(
+                "tool_call_registration_failed",
+                "the session could not record a published function call",
+            )
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
+        if updated_runtime is not None:
+            session.replace_runtime_config(updated_runtime)
         self._out.emit(
             {
                 "type": "function_call.done",
                 "session_id": session.session_id,
                 "epoch": session.epoch,
                 "call_id": call_id,
-                "name": function_call["name"],
-                "arguments": function_call["arguments"],
+                "name": name,
+                "arguments": arguments,
+                "item_id": item_id,
+                "response_id": response_id,
             }
         )
 
@@ -1066,27 +1124,11 @@ class ModelChannel:
         if function_call is _INVALID_FUNCTION_CALL:
             self._out.emit_error(
                 "invalid_function_call",
-                "A recognized function call requires call_id and name",
+                _invalid_function_call_message(self._ctx.plugin, model_result),
             )
             return close_reason, True
         if isinstance(function_call, dict):
             await self._expose_function_call(function_call)
-            return close_reason, True
-        if model_result.get("function_call") is True:
-            legacy = _coerce_function_call(
-                {
-                    "call_id": model_result.get("call_id"),
-                    "name": model_result.get("name"),
-                    "arguments": model_result.get("arguments", ""),
-                }
-            )
-            if legacy is None:
-                self._out.emit_error(
-                    "invalid_function_call",
-                    "A recognized function call requires call_id and name",
-                )
-            else:
-                await self._expose_function_call(legacy)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
@@ -1135,8 +1177,18 @@ class ModelChannel:
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
+                request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
+                draining_response_id = (
+                    session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
+                )
                 self._ctx.services.spawn(
-                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_model_turn_id=model_turn_id),
+                    self.maybe_continue_response(
+                        expected_epoch=expected_epoch,
+                        expected_model_turn_id=model_turn_id,
+                        expected_response_id=draining_response_id or session.active_response_id,
+                        finished_segment=True,
+                        finished_request_id=request_key,
+                    ),
                     name="duplex-continue",
                 )
             return close_reason, emitted_response
@@ -1304,7 +1356,13 @@ class ModelChannel:
             and auto_response
         ):
             self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=response_id if isinstance(response_id, str) else None,
+                    finished_segment=True,
+                    finished_request_id=(data_plane_request_id if isinstance(data_plane_request_id, str) else None),
+                ),
+                name="duplex-continue",
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
@@ -1570,11 +1628,17 @@ class ModelChannel:
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
         expected_response_id: str | None = None,
+        finished_segment: bool = False,
+        finished_request_id: str | None = None,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
         response_id = session.active_response_id
         if expected_response_id is not None and response_id != expected_response_id:
+            return
+        # This segment did not own a response. A response opened while the
+        # spawned task waited belongs to someone else.
+        if finished_segment and expected_response_id is None and response_id is not None:
             return
         auto_response = self._out.auto_responds()
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
@@ -1587,13 +1651,24 @@ class ModelChannel:
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
-            # A fast tool result must not end the response while the original
-            # request is still running. Ending it clears active_request_id and
-            # the later final cannot own the stream.
+            # While stage0 is still producing, closing here clears
+            # active_request_id and the later final cannot own the stream.
+            # A finished segment may close only when that same request is still
+            # the active one. expected_response_id already drops a segment whose
+            # response was replaced before this spawned task ran.
             request_id = getattr(session, "active_request_id", None)
             data_plane = getattr(self._ctx.plugin, "data_plane", None)
+            # A segment from another request has nothing of its own to close,
+            # including when the active request is already terminal or unbound.
+            if finished_segment and isinstance(finished_request_id, str) and finished_request_id != request_id:
+                model_state.clear_continuation()
+                return
+            segment_owns_active_request = (
+                finished_segment and isinstance(finished_request_id, str) and finished_request_id == request_id
+            )
             if (
-                isinstance(request_id, str)
+                not segment_owns_active_request
+                and isinstance(request_id, str)
                 and data_plane is not None
                 and callable(getattr(data_plane, "is_terminal", None))
                 and not data_plane.is_terminal(request_id)
