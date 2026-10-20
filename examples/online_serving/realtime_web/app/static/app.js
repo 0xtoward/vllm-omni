@@ -78,6 +78,8 @@
   let startedAt = 0;
   let running = false;
   let muted = false;
+  // Input samples sent this session; locates the server's open model unit.
+  let inputSamplesSent = 0;
   let assistantActive = false;
   let captureRate = INPUT_RATE;
   let cameraStream = null;
@@ -455,11 +457,28 @@
       return;
     }
 
+    // MiniCPM VISION units advance on fresh camera frames even with a muted mic.
+    // Never reuse a sticky frame at the faster audio flush cadence.
+    if (profile.videoOnlyMessages && muted) {
+      pendingCapture = [];
+      if (running && connectionReady && cameraPendingFrame) {
+        for (const event of profile.videoOnlyMessages(cameraPendingFrame)) {
+          socket.send(JSON.stringify(event));
+        }
+        cameraPendingFrame = null;
+      }
+      return;
+    }
+
     if (pendingCapture.length === 0) return;
     if (!microphoneUploadEnabled()) {
       pendingCapture = [];
       return;
     }
+    sendCapturedAudio();
+  }
+
+  function sendCapturedAudio({ padToUnit = false } = {}) {
     const length = pendingCapture.reduce((total, chunk) => total + chunk.length, 0);
     const merged = new Int16Array(length);
     let offset = 0;
@@ -468,7 +487,13 @@
       offset += chunk.length;
     }
     pendingCapture = [];
-    const pcm = resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE);
+    let pcm = length ? resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE) : merged;
+    if (padToUnit && profile.inputUnitSamples) {
+      const unit = profile.inputUnitSamples;
+      const padded = new Int16Array(pcm.length + ((unit - ((inputSamplesSent + pcm.length) % unit)) % unit));
+      padded.set(pcm);
+      pcm = padded;
+    }
     if (!pcm.length) return;
     const frame = cameraPendingFrame || (profile.stickyCamera ? cameraLastFrame : null);
     cameraPendingFrame = null;
@@ -476,6 +501,7 @@
       ? profile.append(int16ToBase64(pcm), frame, { isSpeech: true })
       : profile.append(int16ToBase64(pcm), frame);
     socket.send(JSON.stringify(appendEvent));
+    inputSamplesSent += pcm.length;
     if (profile.pushToTalk) pttUploadedInput = true;
   }
 
@@ -960,6 +986,7 @@
       await openSocket();
       running = true;
       muted = false;
+      inputSamplesSent = 0;
       pttHeld = false;
       assistantActive = false;
       visionFollowQueue = [];
@@ -992,9 +1019,10 @@
     cameraPreview.srcObject = cameraStream;
     cameraPreview.style.display = '';
     await cameraPreview.play().catch(() => {});
-    // JPEG quality 0.7; no client-side resize (server scale_resolution=448).
+    // JPEG quality defaults to 0.7; no client-side resize (server scale_resolution=448).
     // Interval is per-profile: AURA 2 fps, MiniCPM/Qwen stay at 1 s.
     const cameraIntervalMs = profile.cameraIntervalMs || 1000;
+    const cameraJpegQuality = profile.cameraJpegQuality || 0.7;
     const captureCameraFrame = () => {
       if (!cameraStream || cameraPreview.videoWidth === 0) return;
       const scale = profile.cameraMaxDimension
@@ -1002,7 +1030,7 @@
       cameraCanvas.width = Math.max(1, Math.round(cameraPreview.videoWidth * scale));
       cameraCanvas.height = Math.max(1, Math.round(cameraPreview.videoHeight * scale));
       cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0, cameraCanvas.width, cameraCanvas.height);
-      const frame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+      const frame = cameraCanvas.toDataURL('image/jpeg', cameraJpegQuality).split(',')[1];
       if (profile.imageMessages) {
         if (connectionReady && socket?.readyState === WebSocket.OPEN) {
           for (const event of profile.imageMessages(frame)) socket.send(JSON.stringify(event));
@@ -1147,6 +1175,11 @@
 
   function toggleMute() {
     if (!running) return;
+    // Frame-only units bypass a partial audio unit on the server, so close it
+    // with silence (as a commit would) before unmuted audio splices onto it.
+    if (!muted && profile.inputUnitSamples && socket?.readyState === WebSocket.OPEN && microphoneUploadEnabled()) {
+      sendCapturedAudio({ padToUnit: true });
+    }
     muted = !muted;
     pendingCapture = [];
     muteButton.textContent = muted ? 'Unmute' : 'Mute';

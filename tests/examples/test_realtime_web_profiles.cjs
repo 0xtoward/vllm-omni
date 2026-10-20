@@ -193,7 +193,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   // Expose closure controls only in the test VM; production has no test API.
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
-      microphoneUploadEnabled, flushCapture, setPttHeld, awaitQueue: () => audioChain,
+      microphoneUploadEnabled, flushCapture, setPttHeld, toggleMute, awaitQueue: () => audioChain,
       capture(samples = [100, 200]) { pendingCapture.push(new Int16Array(samples)); },
       setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
       state() { return { running, connectionReady, assistantActive, pttHeld, turnSubmitted, visionTurnLocked }; }
@@ -1226,4 +1226,62 @@ test('JoyAI camera and PTT profiles keep their existing speech-start handling', 
   for (const config of [{}, { speechInput: true, turnMode: 'manual' }]) {
     assert.equal(profiles['joyai-turn'](config).mapEvent(speech).kind, 'ignore');
   }
+});
+
+
+test('MiniCPM muted microphone sends each fresh camera frame without audio or commit', async () => {
+  const app = shell('minicpm-native');
+  await app.ui.startSession();
+  app.ui.capture();
+  app.ui.flushCapture();
+  app.ui.capture();
+  app.ui.setPendingFrame('PRE_MUTE');
+  app.ui.toggleMute();
+  const audioSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(audioSamples, 16000, 'mute closes the open 1 s unit with silence');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['PRE_MUTE']);
+  app.ui.setPendingFrame('VISION1');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1), {
+    type: 'input_audio_buffer.append', video_frames: ['VISION1'],
+  });
+  const count = app.sockets[0].sent.length;
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count, 'no repeated frame or empty append');
+  app.ui.setPendingFrame('VISION2');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['VISION2']);
+  app.ui.toggleMute();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count + 1, 'old captured audio was discarded');
+  app.ui.capture();
+  app.ui.setPendingFrame('OMNI');
+  app.ui.flushCapture();
+  assert.equal(typeof app.sockets[0].sent.at(-1).audio, 'string');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['OMNI']);
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.commit'), false);
+  const sentBeforeBoundaryMute = app.sockets[0].sent.length;
+  app.ui.toggleMute();
+  app.ui.toggleMute();
+  const unitSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(unitSamples % 16000, 0, 'a second mute also lands on a unit boundary');
+  app.ui.toggleMute();
+  assert.equal(
+    app.sockets[0].sent.length,
+    sentBeforeBoundaryMute + 1,
+    'muting on a unit boundary sends no extra silence',
+  );
+});
+
+test('muted Qwen manual profile does not send MiniCPM frame-only input', async () => {
+  const app = shell('qwen3-turn');
+  await app.ui.startSession();
+  app.ui.toggleMute();
+  app.ui.setPendingFrame('FRAME');
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
 });
