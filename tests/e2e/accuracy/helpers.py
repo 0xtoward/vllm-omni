@@ -33,6 +33,7 @@ from PIL import Image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 FTFY_SITECUSTOMIZE_MOCK_DIR = Path(__file__).with_name("ftfy_mock")
+MEDIA_TOOL_TIMEOUT_SECONDS = 5 * 60
 
 
 class IdentityFtfy:
@@ -1030,10 +1031,11 @@ def probe_binary(binary: str, *, test_name: str = "video similarity e2e test") -
 
 
 def probe_video(path: Path) -> dict[str, int | float]:
-    probe_binary("ffprobe")
+    ffprobe = probe_binary("ffprobe")
+    print(f"Probing video metadata: {path}", flush=True)
     result = subprocess.run(
         [
-            "ffprobe",
+            ffprobe,
             "-v",
             "error",
             "-select_streams",
@@ -1048,15 +1050,19 @@ def probe_video(path: Path) -> dict[str, int | float]:
         capture_output=True,
         text=True,
         check=True,
+        stdin=subprocess.DEVNULL,
+        timeout=MEDIA_TOOL_TIMEOUT_SECONDS,
     )
     return parse_video_metadata(json.loads(result.stdout))
 
 
 def run_ffmpeg_similarity(filter_name: str, first: Path, second: Path) -> str:
-    probe_binary("ffmpeg")
+    ffmpeg = probe_binary("ffmpeg")
+    print(f"Running FFmpeg {filter_name} comparison: {first} vs {second}", flush=True)
     result = subprocess.run(
         [
-            "ffmpeg",
+            ffmpeg,
+            "-nostdin",
             "-hide_banner",
             "-i",
             str(first),
@@ -1071,6 +1077,8 @@ def run_ffmpeg_similarity(filter_name: str, first: Path, second: Path) -> str:
         capture_output=True,
         text=True,
         check=True,
+        stdin=subprocess.DEVNULL,
+        timeout=MEDIA_TOOL_TIMEOUT_SECONDS,
     )
     return result.stderr
 
